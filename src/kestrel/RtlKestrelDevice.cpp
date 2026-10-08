@@ -315,10 +315,8 @@ void RtlKestrelDevice::InitWrite(SelectedChannel channel) {
     if (!_hal.register_ap_role(mac.data()) ||
         !_hal.set_port_net_type(kestrel::reg::MAC_AX_NET_TYPE_AP))
       throw std::runtime_error("Kestrel ACK AP role failed");
-    if (_cfg.tx.ampdu && _cfg.tx.ampdu->enabled &&
-        !_cfg.tx.ampdu->no_ack) {
-      if (!_cfg.rx.ack_peer ||
-          !_hal.register_ba_peer_sta(mac.data(),
+    if (_cfg.rx.ack_peer) {
+      if (!_hal.register_ba_peer_sta(mac.data(),
                                    _cfg.rx.ack_peer->bytes.data(),
                                    /*macid=*/1, /*addr_cam_idx=*/1))
         throw std::runtime_error("Kestrel BA peer role failed");
@@ -1299,7 +1297,10 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
   std::vector<uint8_t> tx_buf;
   const auto seq = _tx_seq.fetch_add(1, std::memory_order_relaxed) & 0xfff;
   if (use_data_q) {
-    const uint8_t macid = ampdu && !_ampdu.no_ack ? 1 : 0;
+    // Ordinary peer unicast needs the same ACK context as its A-MPDU frames.
+    const uint8_t macid = kestrel::data_macid(
+        frame, flen, _cfg.rx.ack_responder && _cfg.rx.ack_peer
+                         ? _cfg.rx.ack_peer->bytes.data() : nullptr);
     kestrel::build_data_txdesc_into(tx_buf, frame, flen, tr, macid, seq, wd_len,
                                     txcnt, ampdu ? _ampdu.max_num : 0,
                                     ampdu ? _ampdu.density : 0, stf);
@@ -1307,8 +1308,12 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
     kestrel::build_mgnt_txdesc_into(tx_buf, frame, flen, tr, 0, seq, wd_len,
                                     txcnt, stf);
   }
-  if (use_data_q)
-    ep = _tx_data_q;
+  if (use_data_q) {
+    ep = _device.is_usb() && _variant == kestrel::ChipVariant::C8852B
+             ? _device.nth_bulk_out_ep(3 + kestrel::data_qsel(frame, flen))
+             : _tx_data_q;
+    if (_device.is_usb() && ep == 0) return false;
+  }
   if (_tx_usb_agg_active) {
     if (_tx_usb_agg_count == 0)
       _tx_usb_agg_ep = ep;
@@ -1348,6 +1353,7 @@ size_t RtlKestrelDevice::send_packets(const TxPacketView *pkts,
     return IRadio::send_packets(pkts, count);
   /* The AX USB aggregation header is a DMA_TXAGG_NUM field in the first WD;
    * only same-endpoint data frames can share one bulk transfer. */
+  uint8_t first_qsel = 0;
   for (size_t i = 0; i < count; ++i) {
     if (pkts[i].data == nullptr)
       return 0;
@@ -1355,6 +1361,9 @@ size_t RtlKestrelDevice::send_packets(const TxPacketView *pkts,
     if (rlen == 0 || rlen >= pkts[i].len ||
         !kestrel::frame_is_data(pkts[i].data + rlen, pkts[i].len - rlen))
       return IRadio::send_packets(pkts, count);
+    const auto qsel = kestrel::data_qsel(pkts[i].data + rlen, pkts[i].len - rlen);
+    if (i == 0) first_qsel = qsel;
+    else if (qsel != first_qsel) return IRadio::send_packets(pkts, count);
   }
   size_t total_accepted = 0;
   for (size_t begin = 0; begin < count; begin += max_frames) {
