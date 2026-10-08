@@ -1184,11 +1184,13 @@ void UsbTransport::transfer_callback(struct libusb_transfer *transfer) {
   /* The payload is transport-owned (allocated in tx_async) — free it with the
    * allocator that made it, never libusb's LIBUSB_TRANSFER_FREE_BUFFER: on
    * Windows a separately-linked libusb frees onto a different CRT heap. */
+  const auto endpoint = transfer->endpoint & 0x0f;
   std::free(transfer->buffer);
   libusb_free_transfer(transfer);
   /* Last, so a quiesce_tx loop that sees _tx_inflight == 0 knows every buffer
    * and transfer is already freed and nothing more will touch this object. */
   self->_tx_async_completed.fetch_add(1, std::memory_order_relaxed);
+  self->_tx_ep_inflight[endpoint].fetch_sub(1, std::memory_order_relaxed);
   self->_tx_inflight.fetch_sub(1, std::memory_order_release);
 }
 
@@ -1252,31 +1254,36 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
    * to us after we were told to stop is not a drop. */
   if (_tx_shutdown.load(std::memory_order_acquire))
     return false;
+  auto& endpoint_inflight = _tx_ep_inflight[tx_ep & 0x0f];
   {
     struct timeval zero {0, 0};
     libusb_handle_events_timeout_completed(_ctx, &zero, nullptr);
-    /* RX events can wake the pump before any TX slot is free; keep the
-     * original 2 ms budget without letting a stalled device block forever. */
-    constexpr int kMaxInflight = 256;
-    if (_tx_inflight.load(std::memory_order_relaxed) >= kMaxInflight) {
-      const auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds(2);
-      while (_tx_inflight.load(std::memory_order_relaxed) >= kMaxInflight) {
-        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
-            deadline - std::chrono::steady_clock::now());
-        if (remaining.count() <= 0 || _tx_shutdown.load(std::memory_order_acquire))
-          return false;
-        struct timeval tv {0, static_cast<long>(remaining.count())};
-        if (libusb_handle_events_timeout_completed(_ctx, &tv, nullptr) != 0)
-          return false;
-      }
+    // Bound bulk backlog without consuming the independent control endpoint's slots.
+    constexpr int kMaxInflight = 16;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(2);
+    for (;;) {
+      if (_tx_shutdown.load(std::memory_order_acquire)) return false;
+      auto count = endpoint_inflight.load(std::memory_order_relaxed);
+      if (count < kMaxInflight && endpoint_inflight.compare_exchange_strong(
+              count, count + 1, std::memory_order_relaxed)) break;
+      const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+          deadline - std::chrono::steady_clock::now());
+      if (remaining.count() <= 0) return false;
+      if (count < kMaxInflight) continue;
+      struct timeval tv {0, static_cast<long>(remaining.count())};
+      if (libusb_handle_events_timeout_completed(_ctx, &tv, nullptr) != 0)
+        return false;
     }
   }
-  if (_tx_shutdown.load(std::memory_order_acquire))
+  if (_tx_shutdown.load(std::memory_order_acquire)) {
+    endpoint_inflight.fetch_sub(1, std::memory_order_relaxed);
     return false;
+  }
 
   libusb_transfer *transfer = libusb_alloc_transfer(0);
   if (!transfer) {
+    endpoint_inflight.fetch_sub(1, std::memory_order_relaxed);
     _logger->error("Failed to allocate transfer");
     return false;
   }
@@ -1288,6 +1295,7 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
    * libusb_alloc_transfer above it and the kernel's own copy at submit. */
   auto *payload = static_cast<uint8_t *>(std::malloc(length));
   if (!payload) {
+    endpoint_inflight.fetch_sub(1, std::memory_order_relaxed);
     _logger->error("Failed to allocate TX payload ({} bytes)", length);
     libusb_free_transfer(transfer);
     return false;
@@ -1380,6 +1388,7 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
     if (it != _tx_live.end())
       _tx_live.erase(it);
   }
+  endpoint_inflight.fetch_sub(1, std::memory_order_relaxed);
   _tx_inflight.fetch_sub(1, std::memory_order_relaxed);
   _tx_failed.fetch_add(1, std::memory_order_relaxed);
   _tx_last_rc.store(rc, std::memory_order_relaxed);

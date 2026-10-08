@@ -8,6 +8,7 @@
  * that discovers the bulk endpoints. The exclusive per-adapter UsbDeviceLock
  * rides here too — its lifetime is the transport's. */
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -253,6 +254,7 @@ private:
    * before the device handle / context go away, and so a soft cap can throttle
    * over-submission. */
   std::atomic<int> _tx_inflight{0};
+  std::array<std::atomic<int>, 16> _tx_ep_inflight{};
 
   /* Submitted-but-not-yet-completed transfers, so quiesce_tx can cancel them
    * by handle. transfer_callback removes its own entry, and it runs on
