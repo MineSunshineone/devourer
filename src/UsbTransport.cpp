@@ -1255,14 +1255,21 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
   {
     struct timeval zero {0, 0};
     libusb_handle_events_timeout_completed(_ctx, &zero, nullptr);
-    /* Reap once at the soft cap, then refuse this submission if still full.
-     * A stalled device must not hold the caller in an unbounded event loop. */
+    /* RX events can wake the pump before any TX slot is free; keep the
+     * original 2 ms budget without letting a stalled device block forever. */
     constexpr int kMaxInflight = 256;
     if (_tx_inflight.load(std::memory_order_relaxed) >= kMaxInflight) {
-      struct timeval tv {0, 2000};
-      if (libusb_handle_events_timeout_completed(_ctx, &tv, nullptr) != 0 ||
-          _tx_inflight.load(std::memory_order_relaxed) >= kMaxInflight)
-        return false;
+      const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(2);
+      while (_tx_inflight.load(std::memory_order_relaxed) >= kMaxInflight) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0 || _tx_shutdown.load(std::memory_order_acquire))
+          return false;
+        struct timeval tv {0, static_cast<long>(remaining.count())};
+        if (libusb_handle_events_timeout_completed(_ctx, &tv, nullptr) != 0)
+          return false;
+      }
     }
   }
   if (_tx_shutdown.load(std::memory_order_acquire))

@@ -15,6 +15,7 @@ body = source.split('bool UsbTransport::tx_async(', 1)[1].split('{', 1)[1]
 body = body.split('  libusb_transfer *transfer', 1)[0]
 code = '''#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <stdexcept>
 #include <sys/time.h>
@@ -24,27 +25,32 @@ struct Probe {
   std::atomic<bool> _tx_shutdown{false};
   void* _ctx=this;
   int mode=0, calls=0;
+  std::chrono::steady_clock::time_point now() const {
+    return std::chrono::steady_clock::time_point{} +
+           std::chrono::microseconds(1000 * (calls > 1 ? calls - 1 : 0));
+  }
   void flush_writes() {}
   bool admit() {
-''' + body + '''    return true;
+''' + body.replace('std::chrono::steady_clock::now()', 'now()') + '''    return true;
   }
 };
 int libusb_handle_events_timeout_completed(void* context, timeval* wait, int*) {
   auto& p=*static_cast<Probe*>(context);
   if (++p.calls > 8) throw std::runtime_error("unbounded full-queue wait");
   if (wait->tv_usec) {
-    assert(wait->tv_sec==0 && wait->tv_usec==2000);
+    assert(wait->tv_sec==0 && wait->tv_usec>0 && wait->tv_usec<=2000);
     if (p.mode==0) p._tx_inflight=255;
     if (p.mode==2) return -1;
     if (p.mode==3) { p._tx_shutdown=true; p._tx_inflight=0; }
+    if (p.mode==4 && p.calls==3) p._tx_inflight=255;
   }
   return 0;
 }
 int main() {
   try {
-    for (int mode=0;mode<4;++mode) {
+    for (int mode=0;mode<5;++mode) {
       Probe p; p.mode=mode; p._tx_inflight=256;
-      assert(p.admit()==(mode==0) && p.calls<=2);
+      assert(p.admit()==(mode==0 || mode==4) && p.calls<=3);
     }
     Probe healthy;
     assert(healthy.admit() && healthy.calls==1);
@@ -58,4 +64,4 @@ with tempfile.TemporaryDirectory(prefix='usb-tx-slot-', dir=sys.argv[1]) as temp
     (root / 'check.cpp').write_text(code)
     subprocess.run(['c++', '-std=c++20', '-O2', str(root / 'check.cpp'), '-o', str(root / 'check')], check=True)
     subprocess.run([str(root / 'check')], check=True)
-print('PASS: healthy/draining/stalled/error/shutdown TX admission')
+print('PASS: healthy/draining/stalled/error/shutdown/RX-wakeup TX admission')
