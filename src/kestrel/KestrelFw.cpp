@@ -421,15 +421,20 @@ bool KestrelFw::fw_role_maintain(uint8_t macid, uint8_t self_role,
 
 bool KestrelFw::fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6],
                                 uint8_t net_type, uint8_t addr_cam_idx,
-                                uint8_t bssid_cam_idx) {
+                                uint8_t bssid_cam_idx,
+                                const uint8_t* target_mac,
+                                const uint8_t* bssid) {
   /* fill_addr_cam_info + fill_bssid_cam_info (addr_cam.c). 15-dword body
    * (fwcmd_addrcam_info): dword0 rsvd, dword7 rsvd. mask_sel = NO_MSK, so both
    * hashes are the full-6-byte XOR (default case). len = ADDR_CAM_ENT_LONG_SIZE
-   * (8852B), b_len = BSSID_CAM_ENT_SIZE. bssid = self_mac (self/NO_LINK STA). */
+   * (8852B), b_len = BSSID_CAM_ENT_SIZE. Peer entries use a distinct TMA
+   * while keeping the local AP MAC as SMA/BSSID. */
+  if (!target_mac) target_mac = self_mac;
+  if (!bssid) bssid = self_mac;
   uint8_t sma_hash = 0, tma_hash = 0;
   for (int i = 0; i < 6; i++) {
     sma_hash ^= self_mac[i];
-    tma_hash ^= self_mac[i];
+    tma_hash ^= target_mac[i];
   }
   uint8_t c[60] = {0};
   auto sw = [](uint32_t v, uint32_t msk, uint32_t sh) {
@@ -450,10 +455,12 @@ bool KestrelFw::fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6],
                        sw(self_mac[2], 0xff, 16) | sw(self_mac[3], 0xff, 24));
   /* dword5: sma[4],sma[5],tma[0],tma[1] */
   put_le32(c + 20, sw(self_mac[4], 0xff, 0) | sw(self_mac[5], 0xff, 8) |
-                       sw(self_mac[0], 0xff, 16) | sw(self_mac[1], 0xff, 24));
+                       sw(target_mac[0], 0xff, 16) | sw(target_mac[1], 0xff, 24));
   /* dword6: tma[2..5] */
-  put_le32(c + 24, sw(self_mac[2], 0xff, 0) | sw(self_mac[3], 0xff, 8) |
-                       sw(self_mac[4], 0xff, 16) | sw(self_mac[5], 0xff, 24));
+  put_le32(c + 24, sw(target_mac[2], 0xff, 0) |
+                       sw(target_mac[3], 0xff, 8) |
+                       sw(target_mac[4], 0xff, 16) |
+                       sw(target_mac[5], 0xff, 24));
   /* dword7 rsvd (c+28) */
   /* dword8: macid / port_int / tsf_sync / tgt_ind / frm_tgt_ind (all 0 here) */
   put_le32(c + 32, sw(macid, 0xff, 0));
@@ -463,11 +470,11 @@ bool KestrelFw::fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6],
                        sw(r::BSSID_CAM_ENT_SIZE, 0xff, 16));
   /* dword13: b_valid / b_msk(NO_MSK) / bss_color / bssid[0..1] */
   put_le32(c + 52, 0x1u /* B_VALID BIT(0) */ | sw(r::MAC_AX_NO_MSK, 0x3f, 2) |
-                       sw(0, 0x3f, 8) | sw(self_mac[0], 0xff, 16) |
-                       sw(self_mac[1], 0xff, 24));
+                       sw(0, 0x3f, 8) | sw(bssid[0], 0xff, 16) |
+                       sw(bssid[1], 0xff, 24));
   /* dword14: bssid[2..5] */
-  put_le32(c + 56, sw(self_mac[2], 0xff, 0) | sw(self_mac[3], 0xff, 8) |
-                       sw(self_mac[4], 0xff, 16) | sw(self_mac[5], 0xff, 24));
+  put_le32(c + 56, sw(bssid[2], 0xff, 0) | sw(bssid[3], 0xff, 8) |
+                       sw(bssid[4], 0xff, 16) | sw(bssid[5], 0xff, 24));
   bool ok = send_h2c_cmd(r::FWCMD_H2C_CAT_MAC, r::FWCMD_H2C_CL_ADDR_CAM_UPDATE,
                          r::FWCMD_H2C_FUNC_ADDRCAM_INFO, c, sizeof(c));
   _logger->info("Kestrel: upd_addr_cam (macid={} net_type={} a_idx={} b_idx={} "
@@ -537,6 +544,26 @@ bool KestrelFw::fw_upd_cctl_basic(uint8_t macid, uint8_t addr_cam_idx,
   _logger->info("Kestrel: upd_cctl (macid={} a_idx={} rate=0x{:x} ntx=0x{:x} "
                 "map_a={} bmc={}) -> {}",
                 macid, addr_cam_idx, datarate, ntx_path_en, path_map_a, bmc,
+                ok ? "sent" : "FAILED");
+  return ok;
+}
+
+bool KestrelFw::fw_ba_cam(uint8_t tid, uint8_t macid, uint16_t ssn,
+                          bool valid) {
+  /* Vendor mac_bacam_info (8852B): one standard band-0 entry, 64-bit bitmap.
+   * The firmware command body is two dwords; dword1 is unused on this die. */
+  uint8_t content[8] = {0};
+  const uint32_t d0 = (valid ? 0x3u : 0u) |
+                      (static_cast<uint32_t>(tid & 0xf) << 4) |
+                      (static_cast<uint32_t>(macid) << 8) |
+                      (static_cast<uint32_t>(ssn & 0xfff) << 20);
+  put_le32(content, d0);
+  const bool ok = send_h2c_cmd(r::FWCMD_H2C_CAT_MAC,
+                               r::FWCMD_H2C_CL_BA_CAM,
+                               r::FWCMD_H2C_FUNC_BA_CAM,
+                               content, sizeof(content));
+  _logger->info("Kestrel: BA CAM {} tid={} macid={} ssn={} -> {}",
+                valid ? "armed" : "cleared", tid, macid, ssn,
                 ok ? "sent" : "FAILED");
   return ok;
 }

@@ -191,7 +191,6 @@ devourer::DeviceConfig devourer_config_from_env() {
       std::fflush(stderr); /* the diagnostic plane is per-line flushed */
     }
   }
-
   /* ---- bf ---- */
   if (const char *snd = env_str("DEVOURER_BF_ARM_SOUNDER")) {
     cfg.bf.arm_sounder = true;
@@ -230,6 +229,7 @@ devourer::DeviceConfig devourer_config_from_env() {
   cfg.tuning.skip_trx_reassert = env_flag("DEVOURER_SKIP_TRX_REASSERT");
   cfg.tuning.skip_rfe_init = env_flag("DEVOURER_SKIP_RFEINIT");
   cfg.tuning.skip_coex = env_flag("DEVOURER_SKIP_COEX");
+  cfg.tuning.kestrel_bt_grant = env_flag("DEVOURER_KESTREL_BT_GRANT");
   cfg.tuning.skip_dig = env_flag("DEVOURER_SKIP_DIG");
   /* Default-on knob: unset = tracking on; only "0" disables it. */
   if (const char *e = env_str("DEVOURER_THERMAL_TRACK"))
