@@ -837,7 +837,7 @@ uint8_t HalKestrel::read_mss_index() {
   return 0;
 }
 
-bool HalKestrel::download_firmware(uint8_t cut) {
+bool HalKestrel::download_firmware(uint8_t cut, bool sounding_nic) {
   /* mac_hal_init order (init.c:406-434): hci_func_en -> dmac_pre_init (DLFW
    * DLE/HFC) -> intf_pre_init (usb_pre_init / pcie_pre_init) -> chk_sec_rec
    * -> fwdl. */
@@ -850,7 +850,7 @@ bool HalKestrel::download_firmware(uint8_t cut) {
   const bool is_sec_ic = read_sec_rec() == 0;
   _logger->info("Kestrel: sec-rec {} (is_sec_ic={})",
                 is_sec_ic ? "secure" : "non-secure", is_sec_ic);
-  return _fw.download_firmware(cut, read_mss_index(), is_sec_ic);
+  return _fw.download_firmware(cut, read_mss_index(), is_sec_ic, sounding_nic);
 }
 
 uint8_t HalKestrel::read_sec_rec() {

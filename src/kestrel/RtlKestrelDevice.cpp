@@ -21,6 +21,7 @@
 #include "SignalStop.h" /* g_devourer_should_stop — set by demo signal handlers */
 #include "RxPacket.h"
 #include "TxDescKestrel.h"
+#include "VhtSounding.h"
 #include "TxReportKestrel.h"
 #include "ieee80211_radiotap.h" /* radiotap iterator + field ids */
 
@@ -160,7 +161,8 @@ bool RtlKestrelDevice::PowerOnEfuseAndFw(kestrel::EfuseInfo &out) {
    * (rtl8852b_halinit.c:556) — FWDL first, then the efuse dump. */
   if (!_hal.power_on())
     return false;
-  if (!_hal.download_firmware(_hal.read_cut()))
+  if (!_hal.download_firmware(_hal.read_cut(),
+          _cfg.bf.txbf_peer.has_value() || _cfg.bf.beamformee_of.has_value()))
     return false;
   return _hal.read_efuse(out);
 }
@@ -171,7 +173,8 @@ bool RtlKestrelDevice::PowerOnFwAndTrx(kestrel::EfuseInfo &out) {
    * feat_init (host-side no-op) -> intf_init (usb) -> [efuse after]. */
   if (!_hal.power_on())
     return false;
-  if (!_hal.download_firmware(_hal.read_cut()))
+  if (!_hal.download_firmware(_hal.read_cut(),
+          _cfg.bf.txbf_peer.has_value() || _cfg.bf.beamformee_of.has_value()))
     return false;
   _hal.enable_bb_rf();
   _hal.mac_sys_init();
@@ -341,6 +344,21 @@ void RtlKestrelDevice::InitWrite(SelectedChannel channel) {
    * register writes on otherwise-unused CMAC sounding regs; matches the vendor
    * init order (mac_init_snd at bring-up). */
   _hal.init_sounding();
+  if (_cfg.bf.txbf_peer || _cfg.bf.beamformee_of) {
+    if (_variant != kestrel::ChipVariant::C8852B ||
+        !_cfg.rx.ack_responder || !_cfg.rx.ack_peer ||
+        !_cfg.tx.ampdu || !_cfg.tx.ampdu->enabled || _cfg.tx.ampdu->no_ack)
+      throw std::invalid_argument("Kestrel SU sounding requires the 8852B reliable-unicast peer");
+    _bf_self = _cfg.rx.ack_responder->bytes;
+    _bf_peer = _cfg.rx.ack_peer->bytes;
+    if ((_cfg.bf.txbf_peer && _cfg.bf.txbf_peer->bytes != _bf_peer) ||
+        (_cfg.bf.beamformee_of && _cfg.bf.beamformee_of->bytes != _bf_peer))
+      throw std::invalid_argument("Kestrel SU sounding MAC must match the configured ACK peer");
+    _bf_bw.store(static_cast<uint8_t>(channel.ChannelWidth));
+    configure_su_csi_peer();
+    _bf_armed = _cfg.bf.txbf_peer.has_value();
+    _logger->info("Kestrel: SU CSI responder armed; host sounding={}", _bf_armed);
+  }
   _logger->info("Kestrel: TX ready on ch{} — mgmt {} 0x{:02x} data 0x{:02x}",
                 channel.Channel, _device.is_usb() ? "ep" : "dma-ch", _tx_mgmt_q,
                 _tx_data_q);
@@ -377,6 +395,7 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
   kestrel::KestrelRxBatch batch;
   const auto emit = [&](const kestrel::KestrelRxFrame& f, const kestrel::KestrelPhySts& phy) {
     if (f.rpkt_type == kestrel::RPKT_TYPE_WIFI && packetProcessor) {
+      receive_beamforming_feedback(f);
       Packet p{};
       p.RxAtrib.pkt_len = static_cast<uint16_t>(f.payload_len);
       p.RxAtrib.crc_err = f.crc_err;
@@ -464,8 +483,11 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
 }
 
 void RtlKestrelDevice::SetMonitorChannel(SelectedChannel channel) {
+  ClearBeamforming();
   _channel = channel;
+  _bf_bw.store(static_cast<uint8_t>(channel.ChannelWidth));
   _hal.set_channel(channel.Channel, channel.ChannelWidth, channel.ChannelOffset, channel.Band);
+  if (_cfg.bf.txbf_peer || _cfg.bf.beamformee_of) configure_su_csi_peer();
 }
 
 void RtlKestrelDevice::SetCcaMode(bool disabled) {
@@ -550,6 +572,7 @@ devourer::RxQuality RtlKestrelDevice::GetRxQuality() {
 }
 
 void RtlKestrelDevice::FastRetune(uint8_t channel, bool /*cache_rf*/) {
+  if (channel != _channel.Channel) ClearBeamforming();
   /* Lean path only for a same-band 20 MHz hop (RF channel switch); anything else
    * (band change or wide/narrow BW, where the center + BB config differ) takes
    * the full SetMonitorChannel. */
@@ -622,6 +645,7 @@ void RtlKestrelDevice::ClearAmpduMode() { (void)SetAmpduMode({}); }
 
 bool RtlKestrelDevice::ConfigureAckPeer(const devourer::MacAddr &local,
                                         const devourer::MacAddr &peer) {
+  ClearBeamforming();
   const auto valid = [](const devourer::MacAddr &mac) {
     return (mac.bytes[0] & 1U) == 0 &&
            std::any_of(mac.bytes.begin(), mac.bytes.end(),
@@ -642,6 +666,7 @@ bool RtlKestrelDevice::ConfigureAckPeer(const devourer::MacAddr &local,
 }
 
 void RtlKestrelDevice::ClearAckPeer() {
+  ClearBeamforming();
   (void)_hal.configure_ba_responder(_ampdu.tid, false);
   (void)_hal.register_sta_role(0, 0, 0);
   (void)_hal.add_self_sta(kInjectSA, /*macid=*/0);
@@ -965,6 +990,83 @@ bool RtlKestrelDevice::StartSounding(const devourer::SoundingConfig &cfg) {
   return _hal.start_sounding(cfg);
 }
 
+void RtlKestrelDevice::configure_su_csi_peer() {
+  std::lock_guard lock(_bf_mutex);
+  const devourer::StaBfCaps caps{.nc = 0, .nr = 1, .ng = 0, .cb = 1,
+                                 .csi_bw = _bf_bw.load()};
+  if (!_hal.register_beamformee(1, 1, caps))
+    throw std::runtime_error("Kestrel SU CSI peer parameters failed");
+  _hal.apply_su_matrix(false);
+}
+
+bool RtlKestrelDevice::SendBeamformingSounding(uint8_t token) {
+  if (!_bf_armed || !_tx_up || _bf_bw.load() > 2) return false;
+  std::lock_guard tx_lock(_tx_packet_mutex);
+  std::lock_guard bf_lock(_bf_mutex);
+  const auto announcement = devourer::bf::vht_ndpa(_bf_self.data(), _bf_peer.data(), token,
+                                                 _bf_bw.load());
+  auto frames = kestrel::build_vht_sounding(announcement.data(), _bf_bw.load(),
+                                           _tx_seq.fetch_add(1) & 0xfff);
+  // NIC/NICCE's firmware sounding command is not the host transmit path.
+  // Keep the hardware matrix detached until a complete current CBR is validated.
+  if (!_bf_active.load()) _hal.prepare_su_sounding();
+  _bf_dialog = token & 63;
+  _bf_pending = true;
+  const bool sent = _async_tx
+      ? _device.send_packet_ep(_tx_mgmt_q, frames.data(), frames.size())
+      : _device.bulk_send_data_sync_ep(_tx_mgmt_q, frames.data(), frames.size(), 20) ==
+            static_cast<int>(frames.size());
+  if (!sent) _bf_pending = false;
+  return sent;
+}
+
+void RtlKestrelDevice::receive_beamforming_feedback(const kestrel::KestrelRxFrame &frame) {
+  if (!_bf_armed || frame.crc_err || frame.icv_err || frame.payload_len < 26 ||
+      frame.payload[24] != 0x15 || frame.payload[25] != 0) return;
+  std::unique_lock lock(_bf_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) { ++_bf_rejected; return; }
+  if (!_bf_pending || !devourer::bf::valid_vht_feedback(
+          {frame.payload, frame.payload_len}, _bf_self.data(), _bf_peer.data(),
+          _bf_bw.load(), _bf_dialog)) {
+    ++_bf_rejected;
+    return;
+  }
+  _bf_pending = false;
+  ++_bf_reports;
+  _bf_feedback_ms.store(devourer::beamforming_now_ms());
+  _bf_apply_requested.store(true);
+}
+
+void RtlKestrelDevice::PollBeamforming(uint64_t max_feedback_age_ms) {
+  if (!_bf_armed || !_bf_apply_requested.load()) return;
+  std::lock_guard lock(_bf_mutex);
+  const auto last = _bf_feedback_ms.load();
+  if (!last || devourer::beamforming_now_ms() - last > max_feedback_age_ms) {
+    _bf_apply_requested.store(false);
+    return;
+  }
+  if (!_hal.su_sounding_valid()) return;
+  _hal.apply_su_matrix(true);
+  _bf_active.store(true);
+  _bf_apply_requested.store(false);
+}
+
+void RtlKestrelDevice::ClearBeamforming() {
+  if (!_bf_armed) return;
+  std::lock_guard lock(_bf_mutex);
+  _bf_pending = false;
+  _bf_apply_requested.store(false);
+  if (_bf_active.load()) _hal.apply_su_matrix(false);
+  _bf_active.store(false);
+}
+
+devourer::BeamformingStatus RtlKestrelDevice::GetBeamformingStatus() {
+  const auto last = _bf_feedback_ms.load();
+  return {.active = _bf_active.load(), .feedback_reports = _bf_reports.load(),
+          .rejected_reports = _bf_rejected.load(),
+          .feedback_age_ms = last ? devourer::beamforming_now_ms() - last : 0};
+}
+
 devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
   devourer::AdapterCaps c;
   c.supported = true;
@@ -1269,6 +1371,9 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
    * they exercise the data power-by-rate path; mgmt/beacon uses the MG0 queue
    * (BULKOUTID0). Falls back to the mgmt ep if the data ep was not resolved. */
   const bool is_data = kestrel::frame_is_data(frame, flen);
+  const bool steered = is_data && flen >= 10 && _bf_active.load() &&
+                       std::memcmp(frame + 4, _bf_peer.data(), 6) == 0;
+  if (steered) tr.stbc = false;
   uint8_t ep = _tx_mgmt_q;
   const bool use_data_q = is_data && _tx_data_ok;
   const bool stf = _device.is_usb(); /* USB store-and-forward descriptor bit */
@@ -1299,7 +1404,7 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
   std::vector<uint8_t> tx_buf;
   const auto seq = _tx_seq.fetch_add(1, std::memory_order_relaxed) & 0xfff;
   if (use_data_q) {
-    const uint8_t macid = ampdu && !_ampdu.no_ack ? 1 : 0;
+    const uint8_t macid = steered || (ampdu && !_ampdu.no_ack) ? 1 : 0;
     kestrel::build_data_txdesc_into(tx_buf, frame, flen, tr, macid, seq, wd_len,
                                     txcnt, ampdu ? _ampdu.max_num : 0,
                                     ampdu ? _ampdu.density : 0, stf);

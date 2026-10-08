@@ -21,6 +21,8 @@
 #include "TxReport.h"     /* CCX TX-status report decode + tx.report event */
 
 #include "BeamformingSounder.h" /* generation-neutral BF self-sounding recipe */
+#include "VhtSounding.h"
+#include "RadiotapBuilder.h"
 
 #include "ChannelFreq.h" /* radiotap CHANNEL freq -> channel (per-packet hop) */
 #include "FrameParserJaguar3.h"
@@ -168,31 +170,7 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
    * Jaguar-2/3 config (0xDB, 16-bit CSI param, RX-filter + own-AID gates, and
    * crucially NO 0x9B4 write — that address is the narrowband clock divider on
    * this generation). See BeamformingSounder.h. */
-  if (_cfg.bf.beamformee_of) {
-    const uint8_t *mac = _cfg.bf.beamformee_of->data();
-    /* Jaguar-3 bring-up never programs the self-MAC (0x0610), so the NDPA
-     * RA has nothing to match. Give the beamformee a known identity here so
-     * the sounder can address it; log it for the test harness. */
-    static const uint8_t kBfeeMac[6] = {0x00, 0xe0, 0x4c, 0x88, 0x22, 0xce};
-    for (uint16_t i = 0; i < 6; ++i)
-      _device.rtw_write8(0x0610 + i, kBfeeMac[i]);
-    /* bf.mu upgrades the responder to an MU beamformee, whose report appends
-     * the per-subcarrier delta-SNR (MU Exclusive Beamforming Report) the SU
-     * report omits. */
-    if (_cfg.bf.mu) {
-      devourer::bf::arm_beamformee_mu(_device, mac, devourer::bf::kBfeeJaguar23);
-      _logger->info("Jaguar3 BF MU-beamformee armed for beamformer "
-                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — "
-                    "beamformee MAC 00:e0:4c:88:22:ce",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    } else {
-      devourer::bf::arm_beamformee(_device, mac, devourer::bf::kBfeeJaguar23);
-      _logger->info("Jaguar3 BF beamformee armed for beamformer "
-                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — "
-                    "beamformee MAC 00:e0:4c:88:22:ce",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    }
-  }
+  arm_beamformee();
 
   if (_cfg.rx.ack_responder &&
       !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
@@ -213,6 +191,29 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
     _station_ready = true; /* every port-0 write of this bring-up is done */
   }
   StartRxLoop(std::move(packetProcessor));
+}
+
+void RtlJaguar3Device::arm_beamformee() {
+  if (_cfg.bf.beamformee_of) {
+    const uint8_t *mac = _cfg.bf.beamformee_of->data();
+    /* Jaguar-3 bring-up never programs the self-MAC (0x0610), so the NDPA
+     * RA has nothing to match. Give the beamformee a known identity here so
+     * the sounder can address it; log it for the test harness. */
+    const auto kBfeeMac = _cfg.rx.ack_responder.value_or(
+        devourer::MacAddr{{0x00, 0xe0, 0x4c, 0x88, 0x22, 0xce}}).bytes;
+    for (uint16_t i = 0; i < 6; ++i)
+      _device.rtw_write8(0x0610 + i, kBfeeMac[i]);
+    /* bf.mu upgrades the responder to an MU beamformee, whose report appends
+     * the per-subcarrier delta-SNR (MU Exclusive Beamforming Report) the SU
+     * report omits. */
+    if (_cfg.bf.mu)
+      devourer::bf::arm_beamformee_mu(_device, mac, devourer::bf::kBfeeJaguar23);
+    else
+      devourer::bf::arm_beamformee(_device, mac, devourer::bf::kBfeeJaguar23);
+    _logger->info("Jaguar3 BF responder armed mu={} self={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                  _cfg.bf.mu, kBfeeMac[0], kBfeeMac[1], kBfeeMac[2],
+                  kBfeeMac[3], kBfeeMac[4], kBfeeMac[5]);
+  }
 }
 
 void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
@@ -395,6 +396,11 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
           devourer::emit_tx_report(
               _logger->events(),
               devourer::parse_ccx_halmac(f.frame, f.frame_len), "halmac");
+        // Vendor halmac_original_c2h_nic.h: CMD_ID_C2H_SND_TXBF=2,
+        // sequence at byte 1, sounding result at byte 2 bit 0.
+        if (is_c2h && _bf_txbf_armed && f.frame_len >= 16 && f.frame[0] == 2)
+          _logger->info("Jaguar3 BF firmware sounding: sequence={} success={}",
+                        f.frame[1], (f.frame[2] & 1) != 0);
         /* Decode the jgr3 PHY-status report (per-frame RSSI/SNR/EVM), which
          * sits immediately after the 24-byte descriptor inside the drvinfo
          * area (monitor_rx_cfg enables APP_PHYSTS + RX_DRVINFO_SZ=4).
@@ -428,45 +434,23 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
           if (_cfg.tuning.cfo_track && phy == PhyStsFill::Full)
             _cfo.add(p.RxAtrib.cfo_tail); /* closed-loop CFO input (#217) */
         }
-        /* TX-BF apply gate (DEVOURER_BF_TXBF): a VHT Compressed Beamforming
-         * Report (category 0x15, action 0x00) from the target peer (addr2) means
-         * the WMAC just ingested a fresh V matrix — enable the apply toggle so
-         * subsequent TX is steered. Enabling it before any CBR (no V) degrades
-         * the link, so this is the gate. One-shot; V refreshes on each periodic
-         * re-sound automatically. */
-        if (_bf_txbf_armed && !p.RxAtrib.crc_err && f.frame_len >= 26) {
-          const uint8_t *fb = f.frame;
-          if (fb[24] == 0x15 && fb[25] == 0x00 &&
-              std::memcmp(fb + 10, _bf_peer, 6) == 0) {
-            _bf_cbr_count.fetch_add(1, std::memory_order_relaxed);
-            /* try_lock for the reason cfo_tick gives: this is the RX
-             * thread. Busy -> _bf_apply_on stays false, and the next CBR
-             * from the peer retries the apply. */
-            std::unique_lock<std::mutex> lk(_reg_mu, std::defer_lock);
-            const bool want = !_bf_apply_on.load(std::memory_order_relaxed);
-            if (want && !lk.try_lock()) {
-              DVR_DEBUG(_logger, "Jaguar3 BF: CBR ingested but _reg_mu busy "
-                                 "- apply skipped, the next CBR retries");
-            }
-            if (want && lk.owns_lock()) {
-              /* Caught for the reason cfo_tick is: apply_vmatrix is a
-               * register read + write, and a failed transfer throws - which
-               * must not unwind through the extern "C" libusb callback. A
-               * throw leaves _bf_apply_on false, so the next CBR retries. */
-              try {
-                devourer::bf::apply_vmatrix(
-                    _device, true, static_cast<uint8_t>(_channel.ChannelWidth));
-                _bf_apply_on.store(true, std::memory_order_relaxed);
-                _logger->info("Jaguar3 BF: CBR from peer ingested — TXBF "
-                              "apply ENABLED (steering subsequent TX)");
-              } catch (const std::exception &e) {
-                DVR_DEBUG(_logger, "Jaguar3 BF: TXBF apply failed ({}) - "
-                                   "the next CBR retries", e.what());
-              } catch (...) {
-                DVR_DEBUG(_logger, "Jaguar3 BF: TXBF apply failed - the next "
-                                   "CBR retries");
-              }
-            }
+        // Register updates, sounding tokens and invalidation share _reg_mu.
+        // RX never waits for the control-transfer owner; the next sounding retries.
+        if (_bf_txbf_armed && !p.RxAtrib.crc_err && !p.RxAtrib.icv_err &&
+            f.frame_len >= 26 && f.frame[24] == 0x15 && f.frame[25] == 0x00) {
+          std::unique_lock<std::mutex> lk(_reg_mu, std::try_to_lock);
+          if (lk.owns_lock() && devourer::bf::valid_vht_feedback(
+                  {f.frame, f.frame_len}, _bf_self, _bf_peer,
+                  _rx_bw_code.load(), _bf_dialog.load(), p.RxAtrib.fcs_present) &&
+              _bf_pending.exchange(false)) {
+            _bf_cbr_count.fetch_add(1);
+            _bf_feedback_ms.store(devourer::beamforming_now_ms());
+            _bf_report_control.store(static_cast<uint32_t>(f.frame[26]) |
+                (static_cast<uint32_t>(f.frame[27]) << 8) |
+                (static_cast<uint32_t>(f.frame[28]) << 16));
+            _bf_apply_requested.store(true);
+          } else {
+            _bf_rejected_count.fetch_add(1);
           }
         }
         _packetProcessor(p);
@@ -1080,6 +1064,7 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
   timer.stage("fw_coex_query");
   _hal.fw_coex_tdma_off();       /* disable coex time-division (WL keeps antenna) */
   timer.stage("fw_coex_tdma_off");
+  arm_beamformee();
   /* DEVOURER_BF_ARM_SOUNDER=1 — beamforming self-sounding probe (beamformer
    * side): arm the MAC's hardware sounding engine so a TX-descriptor-marked
    * NDPA (DEVOURER_TX_NDPA=1) is followed by a hardware-generated NDP. The MAC
@@ -1100,7 +1085,18 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
                     "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                     m[0], m[1], m[2], m[3], m[4], m[5]);
     }
+    constexpr uint16_t mapping_regs[]{0x1e24, 0x0820, 0x1e2c, 0x1e30};
+    if (_cfg.bf.txbf_peer) {
+      for (unsigned i = 0; i < 4; ++i)
+        _bf_normal_mapping[i] = _device.rtw_read32(mapping_regs[i]);
+    }
     _hal.txbf_rfmode_sounder(); /* RF/BB sounding config — needed for the NDP */
+    if (_cfg.bf.txbf_peer) {
+      for (unsigned i = 0; i < 4; ++i)
+        _bf_steered_mapping[i] = _device.rtw_read32(mapping_regs[i]);
+      _bf_mapping_saved = true;
+      set_bf_data_mapping(false);
+    }
     devourer::bf::arm_sounder(_device, /*snd_ptcl_ctrl=*/0xDB);
     _logger->info("Jaguar3 BF sounder armed (beamformer side)");
   }
@@ -1115,7 +1111,15 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
   if (_cfg.bf.txbf_peer) {
     const uint8_t *m = _cfg.bf.txbf_peer->data();
     for (int i = 0; i < 6; ++i) _bf_peer[i] = m[i];
-    devourer::bf::arm_beamformer_entry(_device, _bf_peer, /*rx_nss=*/2);
+    const auto self = _cfg.bf.sounder_self_mac ? _cfg.bf.sounder_self_mac :
+                                              _cfg.rx.ack_responder;
+    if (!self)
+      throw std::runtime_error("Jaguar3 TXBF requires a configured sounder MAC");
+    std::memcpy(_bf_self, self->data(), 6);
+    devourer::bf::arm_beamformer_entry(_device, _bf_peer, /*rx_nss=*/2, /*g_id=*/63);
+    devourer::bf::apply_vmatrix(_device, false, 0);
+    _bf_apply_on.store(false);
+    _bf_pending.store(false);
     _bf_txbf_armed = true;
     _logger->info("Jaguar3 BF TXBF entry configured for peer "
                   "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — apply gates "
@@ -1537,6 +1541,7 @@ void RtlJaguar3Device::SetCcaMode(bool disabled) {
 }
 
 void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
+  ClearBeamforming();
   /* A window armed before this retune would integrate across the channel
    * change and report the blend as one channel's occupancy. */
   _phydm.on_channel_change();
@@ -1588,6 +1593,7 @@ void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
 }
 
 void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
+  ClearBeamforming();
   std::lock_guard<std::mutex> lk(_reg_mu);
   if (channel == _channel.Channel)
     return; /* no tune, so nothing to spoil — the note goes after this */
@@ -1625,6 +1631,7 @@ void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
 }
 
 void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
+  ClearBeamforming();
   std::lock_guard<std::mutex> lk(_reg_mu);
   if (bw == _channel.ChannelWidth)
     return; /* no reconfiguration, so nothing to spoil */
@@ -2377,6 +2384,83 @@ bool RtlJaguar3Device::send_packet(const uint8_t *packet, size_t length) {
   return send_one(packet, length, am);
 }
 
+bool RtlJaguar3Device::SendBeamformingSounding(uint8_t token) {
+  if (!_bf_txbf_armed || !_cfg.bf.arm_sounder) return false;
+  auto mode = devourer::parse_tx_mode_str("VHT2SS_MCS0/20");
+  mode.bw_mhz = static_cast<uint8_t>(20 << _rx_bw_code.load());
+  mode.no_agg = true;
+  auto frame = devourer::build_stream_radiotap(mode);
+  const auto ndpa = devourer::bf::vht_ndpa(_bf_self, _bf_peer, token, _rx_bw_code.load());
+  frame.insert(frame.end(), ndpa.begin(), ndpa.end());
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _bf_dialog.store(token & 63);
+    _bf_pending.store(true);
+  }
+  const bool sent = send_packet(frame.data(), frame.size());
+  if (!sent) _bf_pending.store(false);
+  return sent;
+}
+
+void RtlJaguar3Device::PollBeamforming(uint64_t max_feedback_age_ms) {
+  if (!_bf_txbf_armed || !_bf_apply_requested.load()) return;
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  const auto last = _bf_feedback_ms.load();
+  const bool fresh = last && devourer::beamforming_now_ms() - last <= max_feedback_age_ms;
+  // RX_CSI_RPT_INFO[24:1] must match each new report, including while active.
+  const auto hardware = fresh ? _device.rtw_read32(0x071c) : 0;
+  const auto expected = _bf_report_control.load();
+  if (!fresh || ((hardware >> 1) & 0xffffffu) != expected) {
+    if (fresh && ++_bf_hw_mismatches <= 3)
+      _logger->warn("Jaguar3 BF: CSI not latched hw=0x{:08x} expected_mimo=0x{:06x}; apply withheld",
+                      hardware, expected);
+    if (_bf_apply_on.load()) {
+      devourer::bf::apply_vmatrix(_device, false, 0);
+      set_bf_data_mapping(false);
+      _bf_apply_on.store(false);
+    }
+    _bf_apply_requested.store(false);
+    return;
+  }
+  if (!_bf_apply_on.load()) {
+    set_bf_data_mapping(true);
+    devourer::bf::apply_vmatrix(_device, true, _rx_bw_code.load());
+    _bf_apply_on.store(true);
+    _logger->info("Jaguar3 BF: complete CBR from peer — TXBF apply ENABLED");
+  }
+  _bf_apply_requested.store(false);
+}
+
+void RtlJaguar3Device::ClearBeamforming() {
+  if (!_bf_txbf_armed) return;
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  _bf_pending.store(false);
+  _bf_apply_requested.store(false);
+  if (_bf_apply_on.load()) devourer::bf::apply_vmatrix(_device, false, 0);
+  if (_bf_apply_on.load()) set_bf_data_mapping(false);
+  _bf_apply_on.store(false);
+}
+
+void RtlJaguar3Device::set_bf_data_mapping(bool enabled) {
+  if (!_bf_mapping_saved) return;
+  constexpr uint16_t registers[]{0x1e24, 0x0820, 0x1e2c, 0x1e30};
+  constexpr uint32_t masks[]{0x70000800u, 0xffff00ffu, 0xffffu, 0xffffu};
+  const auto& saved = enabled ? _bf_steered_mapping : _bf_normal_mapping;
+  for (unsigned i = 0; i < 4; ++i) {
+    const auto current = _device.rtw_read32(registers[i]);
+    const auto updated = (current & ~masks[i]) | (saved[i] & masks[i]);
+    if (updated != current) _device.rtw_write32(registers[i], updated);
+  }
+}
+
+devourer::BeamformingStatus RtlJaguar3Device::GetBeamformingStatus() {
+  const auto last = _bf_feedback_ms.load();
+  return {.active = _bf_apply_on.load(),
+          .feedback_reports = _bf_cbr_count.load(),
+          .rejected_reports = _bf_rejected_count.load(),
+          .feedback_age_ms = last ? devourer::beamforming_now_ms() - last : 0};
+}
+
 bool RtlJaguar3Device::send_built_block(uint8_t *block, size_t len) {
   const int rc = _device.bulk_send_data_sync_ep(tx_ep_for_descriptor(block),
                                                 block, len,
@@ -2743,7 +2827,15 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
    * data rate (measured: a 1SS NDP yields no CBR); the interleaved data frames
    * keep their radiotap rate (1SS/HT), which is what gets steered. N==1
    * (every-frame self-sounding capture) keeps the caller's rate unchanged. */
-  if (ndpa && ndpa_period > 1) {
+  if (_bf_txbf_armed) {
+    ndpa = devourer::bf::is_vht_ndpa({packet + radiotap_length, frame_len});
+    if (ndpa) {
+      std::lock_guard<std::mutex> lk(_reg_mu);
+      _bf_dialog.store(packet[radiotap_length + 16] >> 2);
+      _bf_pending.store(true);
+    }
+  }
+  if (ndpa && (_bf_txbf_armed || ndpa_period > 1)) {
     fixed_rate = MGN_VHT2SS_MCS0;
     vht = true;
   }
@@ -2786,10 +2878,13 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
   uint8_t pwr_type = _txpkt_dflt_type.load(std::memory_order_relaxed);
   if (radiotap_pkt_pwr_db != INT_MIN)
     pwr_type = txpkt_type_for_idx(txpkt_idx_for_qdb(radiotap_pkt_pwr_db * 4));
+  const bool is_data = frame_len >= 1 && jaguar3::dot11_is_data(dot11[0]);
   jaguar3::fill_data_tx_desc_8822c(
       out, static_cast<uint16_t>(frame_len), MRateToHwRate(fixed_rate), rate_id,
       bw_desc, sgi != 0, ldpc != 0, stbc, bmc, ndpa, data_sc, pwr_type,
-      pkt_offset);
+      pkt_offset, is_data && !bmc && frame_len >= 10 &&
+          _bf_apply_on.load(std::memory_order_relaxed) &&
+          std::memcmp(dot11 + 4, _bf_peer, 6) == 0);
   /* A DATA FRAME BELONGS IN A DATA QUEUE. fill_data_tx_desc_8822c stamps
    * QSEL 0x12 (MGNT) on every descriptor, and init_trx_cfg maps MG to the
    * 64-page HIGH queue that management frames and the beacon share. So DATA
@@ -2804,7 +2899,6 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
    * pure function, jaguar3::tx_qsel() (TxQueueMap.h), which peek_tx_qsel
    * calls with the same inputs, so the two cannot drift. Written here,
    * before the unconditional checksum below. */
-  const bool is_data = frame_len >= 1 && jaguar3::dot11_is_data(dot11[0]);
   const bool ampdu_data = am.enabled && is_data;
   SET_TX_DESC_QSEL_8822C(
       out, jaguar3::tx_qsel(is_data, _device.bulk_out_ep_count(), am.enabled,

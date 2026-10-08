@@ -35,7 +35,8 @@ public:
    * signature (HalKestrel::read_mss_index). `is_sec_ic` (OTP 0x5ED[7]) gates
    * the non-secure IDMEM + CPU-clock FWDL patch. Returns false on any poll
    * timeout or FW error status (checksum/security/cut mismatch), all logged. */
-  bool download_firmware(uint8_t cut, uint8_t mss_idx, bool is_sec_ic);
+  bool download_firmware(uint8_t cut, uint8_t mss_idx, bool is_sec_ic,
+                         bool sounding_nic = false);
 
   /* Send one radio-parameter page as an OUTSRC H2C (halrf radio-to-fw): `cls` =
    * OUTSRC_CL_RADIO_A/B, `page` = page index (H2C func), `packed` = the

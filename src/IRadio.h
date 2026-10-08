@@ -14,6 +14,7 @@
 #include "SelectedChannel.h"
 #include "ThermalStatus.h"
 #include "Sounding.h"
+#include "BeamformingStatus.h"
 #include "TriggerTwt.h"
 #include "TxCaps.h"
 #include "TxMode.h"
@@ -410,8 +411,15 @@ public:
    * path that actually airs a Trigger on this firmware is host-injection
    * (SendTrigger). Returns false where unsupported. See docs/he-trigger-ul.md. */
   virtual bool StartSounding(const devourer::SoundingConfig & /*cfg*/) {
-    return false;
-  }
+      return false;
+    }
+
+  // Explicit SU sounding; false when no configured TXBF backend is available.
+  virtual bool SendBeamformingSounding(uint8_t /*token*/) { return false; }
+  // Caller/TX thread only: synchronous register I/O is illegal in USB callbacks.
+  virtual void PollBeamforming(uint64_t /*max_feedback_age_ms*/) {}
+  virtual void ClearBeamforming() {}
+  virtual devourer::BeamformingStatus GetBeamformingStatus() { return {}; }
 
   /* Batch TX: submit `count` frames (each buffer = radiotap header + 802.11
    * MPDU, the send_packet contract) in one call. With USB TX aggregation

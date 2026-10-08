@@ -990,7 +990,8 @@ bool KestrelFw::fw_pre_init() {
   return hci_func_en() && dmac_pre_init();
 }
 
-bool KestrelFw::download_firmware(uint8_t cut, uint8_t mss_idx, bool is_sec_ic) {
+bool KestrelFw::download_firmware(uint8_t cut, uint8_t mss_idx, bool is_sec_ic,
+                                 bool sounding_nic) {
   _is_sec_ic = is_sec_ic;
   /* Per-variant, cut-selected fw image. 8852B: NICCE, CBV(1)->u2, CCV+(>=2)->u3.
    * 8852C: NIC, CAV(0)->u1_nic, CBV(1+)->u2_nic (fwdl.h INTERNAL_FW_CONTENT_
@@ -1015,13 +1016,13 @@ bool KestrelFw::download_firmware(uint8_t cut, uint8_t mss_idx, bool is_sec_ic) 
 #if defined(DEVOURER_HAVE_KESTREL_8852B)
   if (_variant != ChipVariant::C8852C) {
     if (cut >= 2) {
-      fw = array_8852b_u3_nicce;
-      len = array_8852b_u3_nicce_len;
-      img = "u3_nicce";
+      fw = sounding_nic ? array_8852b_u3_nic : array_8852b_u3_nicce;
+      len = sounding_nic ? array_8852b_u3_nic_len : array_8852b_u3_nicce_len;
+      img = sounding_nic ? "u3_nic" : "u3_nicce";
     } else {
-      fw = array_8852b_u2_nicce;
-      len = array_8852b_u2_nicce_len;
-      img = "u2_nicce";
+      fw = sounding_nic ? array_8852b_u2_nic : array_8852b_u2_nicce;
+      len = sounding_nic ? array_8852b_u2_nic_len : array_8852b_u2_nicce_len;
+      img = sounding_nic ? "u2_nic" : "u2_nicce";
     }
   }
 #endif
