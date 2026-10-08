@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -1739,36 +1740,40 @@ void HalKestrel::coex_mac_init() {
     _device.rtw_write8(r::R_AX_GPIO_MUXCFG,
                        static_cast<uint8_t>(mux | r::B_AX_ENBT));
   }
-  /* coex_mac_init_8852b: disable LTE-coex (CTRL + CTRL_2 = 0), then set the
-   * SDIO-ctrl coex bit. On the WiFi+BT combo die the coex block otherwise
-   * arbitrates the shared front end. */
-  write_lte(r::R_AX_LTECOEX_CTRL, 0);
+  /* coex_mac_init_8852b: reset grant controls, then select the LTE/BT grant
+   * path. The module has a separate BT RF port but still needs its grant. */
+  const bool coex_reset = write_lte(r::R_AX_LTECOEX_CTRL, 0);
   uint8_t val = _device.rtw_read8(r::R_AX_SYS_SDIO_CTRL + 3);
-  write_lte(r::R_AX_LTECOEX_CTRL_2, 0);
+  const bool coex_reset_2 = write_lte(r::R_AX_LTECOEX_CTRL_2, 0);
+  if (_bt_grant && (!coex_reset || !coex_reset_2))
+    throw std::runtime_error("Kestrel: coexistence reset failed");
   _device.rtw_write8(r::R_AX_SYS_SDIO_CTRL + 3,
                      static_cast<uint8_t>(val | (1u << 2)));
-  /* mac_cfg_gnt_8852b with the WiFi-only stance (gnt_wl=1 sw-forced, gnt_bt=0
-   * sw-forced, both bands): devourer runs no BT traffic, so the PTA arbiter is
-   * pinned to WL — the same standing config the Jaguar3 coex thread re-applies
-   * (there the coex fw silences the antenna without it; here the cold-default
-   * GNT does). LTE_SW_CFG_1 = WL RFC+BB S0/S1 VAL|CTRL + BT RFC+BB S0/S1 CTRL
-   * (val 0); LTE_SW_CFG_2 = WL TX/RX VAL|CTRL + BT TX/RX CTRL (val 0), WL_RX_
-   * CTRL preserved. 8852B-only: the 8852C's cold-default GNT is WL-open and
-   * its validated register stream stays untouched. */
+  /* Vendor halbtc BTC_ANT_W2G uses HW PTA for both grants. Forcing both
+   * software grants high makes BT and WLAN transmit into each other. The two
+   * zero writes above leave every SW_CTRL clear for hardware arbitration. */
+  if (_bt_grant) {
+    _logger->info("Kestrel: coexistence grants WL/BT=HW PTA");
+    return;
+  }
+  /* Without BT coexistence requested, keep the upstream WiFi-only stance. */
   if (_variant != ChipVariant::C8852C) {
-    write_lte(r::R_AX_LTE_SW_CFG_1,
+    if (!write_lte(r::R_AX_LTE_SW_CFG_1,
               r::B_AX_GNT_WL_RFC_S0_SW_VAL | r::B_AX_GNT_WL_RFC_S0_SW_CTRL |
                   r::B_AX_GNT_WL_BB_S0_SW_VAL | r::B_AX_GNT_WL_BB_S0_SW_CTRL |
                   r::B_AX_GNT_BT_RFC_S0_SW_CTRL | r::B_AX_GNT_BT_BB_S0_SW_CTRL |
                   r::B_AX_GNT_WL_RFC_S1_SW_VAL | r::B_AX_GNT_WL_RFC_S1_SW_CTRL |
                   r::B_AX_GNT_WL_BB_S1_SW_VAL | r::B_AX_GNT_WL_BB_S1_SW_CTRL |
-                  r::B_AX_GNT_BT_RFC_S1_SW_CTRL | r::B_AX_GNT_BT_BB_S1_SW_CTRL);
+                  r::B_AX_GNT_BT_RFC_S1_SW_CTRL | r::B_AX_GNT_BT_BB_S1_SW_CTRL))
+      _logger->warn("Kestrel: RF coexistence grant write failed");
     /* (WL_RX_CTRL is preserved-if-set in the vendor; the CTRL_2=0 write above
      * just cleared it, so it folds to 0 here.) */
-    write_lte(r::R_AX_LTE_SW_CFG_2,
+    if (!write_lte(r::R_AX_LTE_SW_CFG_2,
               r::B_AX_GNT_WL_RX_SW_VAL | r::B_AX_GNT_WL_RX_SW_CTRL |
                   r::B_AX_GNT_WL_TX_SW_VAL | r::B_AX_GNT_WL_TX_SW_CTRL |
-                  r::B_AX_GNT_BT_RX_SW_CTRL | r::B_AX_GNT_BT_TX_SW_CTRL);
+                  r::B_AX_GNT_BT_RX_SW_CTRL | r::B_AX_GNT_BT_TX_SW_CTRL))
+      _logger->warn("Kestrel: TX/RX coexistence grant write failed");
+    _logger->info("Kestrel: coexistence grants WL=1 BT=0");
   }
 }
 

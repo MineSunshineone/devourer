@@ -470,16 +470,18 @@ int main(int argc, char **argv) {
    * guard — a second devourer on this adapter gets BUSY here and bails before
    * the reset, so it can't re-enumerate the adapter out from under the owner. */
   std::shared_ptr<devourer::UsbDeviceLock> usb_lock;
-  const int wifi_iface = devourer::find_wifi_interface(handle);
-  rc = devourer::claim_interface_then_reset(handle, wifi_iface, logger,
+  /* Reset can re-enumerate these USB dongles.  The reopen variant updates the
+   * handle after that transition; the old claim-then-reset path left duplex
+   * with a stale bulk endpoint and every TX timed out. */
+  rc = devourer::claim_interface_reset_reopen(context, handle, logger,
       termux_fd == 0 && std::getenv("DEVOURER_SKIP_RESET") == nullptr, usb_lock);
   if (rc != 0) {
     /* The claim failed, so nothing owns the handle yet — hand it to the
      * session purely so the unwind closes it. */
-    session.adopt_handle(handle, wifi_iface);
+    session.adopt_handle(handle);
     return 1;
   }
-  session.adopt_handle(handle, wifi_iface);
+  session.adopt_handle(handle);
   session.adopt_lock(usb_lock);
 
   WiFiDriver wifi_driver{logger};

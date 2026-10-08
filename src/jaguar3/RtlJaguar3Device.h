@@ -100,6 +100,9 @@ public:
   bool SetStationIdentity(const devourer::MacAddr &own,
                           const devourer::MacAddr &bssid) override;
   bool ClearStationIdentity() override;
+  bool ConfigureAckPeer(const devourer::MacAddr &local,
+                        const devourer::MacAddr &peer) override;
+  void ClearAckPeer() override;
   /* A-MPDU TX mode (IRadio contract; src/AmpduMode.h). Programs the 8822C
    * aggregate-fill timer (0x455) under _reg_mu (serialized against the coex
    * thread) and records the descriptor state the TX path reads. */
@@ -466,6 +469,7 @@ private:
    * sessions get chain B too — the kernel routes it in rtl8822e_init_misc,
    * which runs in both directions. */
   void apply_dpdt_route_8822e();
+  void reapply_8822e_5g_path(uint8_t channel);
   /* Runtime TX-mode default (SetTxMode/ClearTxMode). */
   std::optional<devourer::TxMode> _tx_mode_default;
 

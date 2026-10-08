@@ -1315,6 +1315,12 @@ if(DEVOURER_KESTREL)
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME kestrel_txreport COMMAND KestrelTxReportSelftest)
 
+    add_executable(KestrelAmpduDescSelftest tests/kestrel_ampdu_desc_selftest.cpp)
+    target_compile_features(KestrelAmpduDescSelftest PRIVATE cxx_std_20)
+    target_include_directories(KestrelAmpduDescSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME kestrel_ampdu_desc COMMAND KestrelAmpduDescSelftest)
+
     # Golden-bytes guard for the trigger-UL + TWT H2C content encoders
     # (src/kestrel/SchedEncode.h): each config's emitted LE dwords vs the
     # hand-computed vendor SET_WORD layout (F2P v0/v1, TWT, UL_FIXINFO).

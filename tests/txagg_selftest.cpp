@@ -243,6 +243,7 @@ static void test_desc_8822c() {
   SET_TX_DESC_DMA_TXAGG_NUM_8822C(blk, 9);
   jaguar3::cal_txdesc_chksum_8822c(blk);
   CHECK(blk[0x1F] == 9, "8822c: agg num byte 0x1F=%u want 9", blk[0x1F]);
+
 }
 #endif /* DEVOURER_HAVE_JAGUAR3 */
 

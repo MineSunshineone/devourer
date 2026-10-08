@@ -321,6 +321,15 @@ public:
    * so there is nothing to undo - the "trivially true" case above. A false
    * here would report an unverified rollback for a port nothing touched. */
   virtual bool ClearStationIdentity() { return true; }
+  /* Runtime pairing hook. Discovery supplies the peer after bring-up; a
+   * backend may retarget its local ACK/BA context without reopening USB. */
+  virtual bool ConfigureAckPeer(const devourer::MacAddr &local,
+                                const devourer::MacAddr &peer) {
+    (void)local;
+    (void)peer;
+    return false;
+  }
+  virtual void ClearAckPeer() {}
 
   /* 802.11 A-MPDU TX mode (src/AmpduMode.h): the first-class bundle of the
    * recipe the spike + pacing sweep proved on-air. When enabled, every data
