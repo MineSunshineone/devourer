@@ -1,5 +1,6 @@
 #include "kestrel/TxDescKestrel.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -33,6 +34,35 @@ int main() {
                    body);
       return 1;
     }
+    constexpr std::array<uint8_t, 8> queues{0, 1, 1, 0, 2, 2, 3, 3};
+    constexpr std::array<uint8_t, 8> indicators{0, 0, 1, 1, 0, 1, 0, 1};
+    for (uint8_t tid = 0; tid < 8; ++tid) {
+      qos[24] = tid;
+      kestrel::build_data_txdesc_into(plain, qos.data(), qos.size(), rate,
+                                      1, 1, body, 13);
+      const auto d2 = le32(plain, 8);
+      const auto dma = (le32(plain, 0) >> 16) & 0xf;
+      if (((d2 >> 17) & 0x3f) != queues[tid] ||
+          ((d2 >> 23) & 1) != indicators[tid] ||
+          ((d2 >> 24) & 0x7f) != 1 ||
+          dma != (body == kestrel::WD_BODY_LEN ? queues[tid] : 0)) {
+        std::fprintf(stderr, "Kestrel QoS queue mismatch (body=%u tid=%u)\n",
+                     body, tid);
+        return 1;
+      }
+    }
+    qos[24] = 0;
   }
+  const std::array<uint8_t, 6> peer{2, 0x42, 0x58, 0x49, 0x24, 0x22};
+  std::copy(peer.begin(), peer.end(), qos.begin() + 4);
+  if (kestrel::data_macid(qos.data(), qos.size(), peer.data()) != 1 ||
+      kestrel::data_macid(qos.data(), qos.size(), nullptr) != 0 ||
+      kestrel::data_macid(qos.data(), 9, peer.data()) != 0) return 1;
+  qos[4] = 0xff;
+  if (kestrel::data_macid(qos.data(), qos.size(), peer.data()) != 0) return 1;
+  qos[24] = 6;
+  if (kestrel::data_qsel(qos.data(), 25) != 0) return 1;
+  qos[0] = 0x08;
+  if (kestrel::data_qsel(qos.data(), qos.size()) != 0) return 1;
   return 0;
 }
