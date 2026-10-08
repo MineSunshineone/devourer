@@ -2,7 +2,9 @@
 
 #include <chrono>
 #include <thread>
+#include <algorithm>
 #include <climits> /* INT_MIN = "no radiotap DBM_TX_POWER" sentinel */
+#include <cstdlib>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
@@ -73,6 +75,8 @@ RtlKestrelDevice::RtlKestrelDevice(RtlAdapter device, Logger_t logger,
   /* FastRetune firmware IO-offload (8852B same-sub-band hop). Armed here so it
    * covers every bring-up path; a no-op on the 8852C / relock path. */
   _hal.set_kfr_ofld(_cfg.tuning.kestrel_fastretune_ofld != 0);
+  _hal.set_bt_grant(_cfg.tuning.kestrel_bt_grant);
+  _async_tx = std::getenv("DEVOURER_KESTREL_ASYNC_TX") != nullptr;
   /* DEVOURER_TX_PWR on Kestrel = the fixed BB TX power in whole dBm (distinct
    * from the Jaguar2 TXAGC-index meaning). Applied at every set_channel. */
   if (_cfg.tx.power_index.has_value())
@@ -302,15 +306,31 @@ void RtlKestrelDevice::InitWrite(SelectedChannel channel) {
    * linchpin for the USR_TX_RPT report firing (and, later, data TX + power-by-
    * rate). Then enable the per-user TX report (freerun TX-egress timestamps);
    * the C2H reports are decoded in handle_c2h when the RX loop is up. */
-  _hal.register_sta_role(0, 0, 0);
-  /* The rest of _add_role: program the ADDR_CAM entry + CMAC control table for
-   * macid 0 (the WD macid our descriptors carry). This is what actually gives
-   * the TX engine an antenna path (cctl ntx_path_en) + BSS/rate context, so
-   * queued frames air and their PLE pages release — without it the mgmt
-   * bulk-OUT stalls deterministically at ~103. SA = the canonical injection
-   * source address (examples/tx/main.cpp beacon SA). */
-  _hal.add_self_sta(kInjectSA, /*macid=*/0);
+  /* The 8852B AP role answers unicast frames; its associated peer MACID
+   * supplies the BlockAck context for ACK-enabled A-MPDU. */
+  if (_cfg.rx.ack_responder) {
+    if (_variant != kestrel::ChipVariant::C8852B)
+      throw std::invalid_argument("Kestrel ACK responder requires 8852B");
+    const auto& mac = _cfg.rx.ack_responder->bytes;
+    if (!_hal.register_ap_role(mac.data()) ||
+        !_hal.set_port_net_type(kestrel::reg::MAC_AX_NET_TYPE_AP))
+      throw std::runtime_error("Kestrel ACK AP role failed");
+    if (_cfg.tx.ampdu && _cfg.tx.ampdu->enabled &&
+        !_cfg.tx.ampdu->no_ack) {
+      if (!_cfg.rx.ack_peer ||
+          !_hal.register_ba_peer_sta(mac.data(),
+                                   _cfg.rx.ack_peer->bytes.data(),
+                                   /*macid=*/1, /*addr_cam_idx=*/1))
+        throw std::runtime_error("Kestrel BA peer role failed");
+    }
+    _logger->info("Kestrel ACK responder: AP role armed");
+  } else {
+    _hal.register_sta_role(0, 0, 0);
+    _hal.add_self_sta(kInjectSA, /*macid=*/0);
+  }
   _hal.enable_tx_report(kestrel::reg::USR_TX_RPT_MODE_PERIOD, 0, 0);
+  if (_cfg.tx.ampdu && !SetAmpduMode(*_cfg.tx.ampdu))
+    throw std::invalid_argument("unsupported Kestrel A-MPDU mode");
   /* Diagnostic (DEVOURER_KESTREL_FWLOG): route the fw log to C2H packets to
    * probe whether async packet-C2H reaches the host at all (task #12/#236). */
   if (_cfg.debug.kestrel_fw_log)
@@ -354,6 +374,45 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
    * divergence between the dies. */
   const uint16_t drv_info_unit =
       _variant == kestrel::ChipVariant::C8852C ? 16 : 8;
+  kestrel::KestrelRxBatch batch;
+  const auto emit = [&](const kestrel::KestrelRxFrame& f, const kestrel::KestrelPhySts& phy) {
+    if (f.rpkt_type == kestrel::RPKT_TYPE_WIFI && packetProcessor) {
+      Packet p{};
+      p.RxAtrib.pkt_len = static_cast<uint16_t>(f.payload_len);
+      p.RxAtrib.crc_err = f.crc_err;
+      p.RxAtrib.icv_err = f.icv_err;
+      p.RxAtrib.data_rate = f.rx_rate; /* 9-bit AX code (HE >= 0x180) */
+      p.RxAtrib.bw = f.bw;
+      p.RxAtrib.ppdu_type = f.ppdu_type; /* 7=HE_SU 8=HE_ERSU */
+      p.RxAtrib.ppdu_cnt = f.ppdu_cnt;
+      p.RxAtrib.tsfl = f.freerun_cnt;
+      for (int i = 0; i < 4; i++) {
+        p.RxAtrib.rssi[i] = phy.rssi[i];
+        p.RxAtrib.snr[i] = phy.snr[i];
+        p.RxAtrib.evm[i] = phy.evm[i];
+      }
+      /* Window aggregates fold CRC-clean frames only (the Jaguar
+       * convention): a garbled frame's physts would bias the
+       * means and the active-chain classification.
+       *
+       * _rxq: passive rssi-snr floor + LinkHealth, fed path-A RSSI +
+       * the IE01 average SNR (the all-paths quantity the passive floor
+       * was validated against; per-path SNR goes to _rxpaths instead).
+       * A frame with no IE_01 SNR (snr_avg=0) still counts toward RSSI.
+       * _rxpaths: per-antenna window means (GetActiveRxPaths). Both
+       * dies are 2 RX chains; C/D read 0 and are excluded by n_chains. */
+      if (!f.crc_err && !f.icv_err) {
+        if (phy.rssi[0] > 0)
+          _rxq.add(phy.rssi[0], phy.snr_avg, 0);
+        _rxpaths.add(p.RxAtrib.rssi, p.RxAtrib.snr, p.RxAtrib.evm, 2);
+      }
+      p.Data = std::span<uint8_t>(const_cast<uint8_t *>(f.payload),
+                                  f.payload_len);
+      packetProcessor(p);
+    } else if (f.rpkt_type == kestrel::RPKT_TYPE_C2H) {
+      handle_c2h(f.payload, f.payload_len);
+    }
+  };
   long long parse_aborts = 0;
   _rx_running = true;
   struct RunningGuard {
@@ -375,20 +434,6 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
             break;
           }
           if (f.rpkt_type == kestrel::RPKT_TYPE_PPDU && f.payload_len >= 8) {
-            /* Full physts parse (header per-path rssi_td + IE01 avg SNR +
-             * IE04..07 per-path SNR/EVM pages) — kestrel::parse_physts_8852.
-             * Cached for the following WIFI frame(s) in the aggregate.
-             * On-air-validated on BOTH dies for the header + IE_01 offsets
-             * (passive floor cross-matches the NHM floor within ~1 dB): the
-             * C8852C physts is bit-identical to the C8852B once its measurement
-             * engine is brought up (the 8852C branch in
-             * kestrel_halbb_rx_bringup + the R_AX_PPDU_STAT no-APP-prepend
-             * config in bb_reset_all) — same header, same IE walk. */
-            kestrel::KestrelPhySts ps;
-            if (kestrel::parse_physts_8852(
-                    f.payload, f.payload_len,
-                    _variant == kestrel::ChipVariant::C8852C, ps))
-              _last_physts = ps;
             /* Trace: raw physts blobs (first few) — the IE-page ground truth
              * when a per-path metric reads 0 (is the page absent, or zero?). */
             static int physts_dumped = 0;
@@ -404,46 +449,13 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
               }
               _logger->trace("Kestrel physts[{}B]: {}", f.payload_len, hex);
             }
-          } else if (f.rpkt_type == kestrel::RPKT_TYPE_WIFI && packetProcessor) {
-            Packet p{};
-            p.RxAtrib.pkt_len = static_cast<uint16_t>(f.payload_len);
-            p.RxAtrib.crc_err = f.crc_err;
-            p.RxAtrib.icv_err = f.icv_err;
-            p.RxAtrib.data_rate = f.rx_rate; /* 9-bit AX code (HE >= 0x180) */
-            p.RxAtrib.bw = f.bw;
-            p.RxAtrib.ppdu_type = f.ppdu_type; /* 7=HE_SU 8=HE_ERSU */
-            p.RxAtrib.ppdu_cnt = f.ppdu_cnt;
-            p.RxAtrib.tsfl = f.freerun_cnt;
-            for (int i = 0; i < 4; i++) {
-              p.RxAtrib.rssi[i] = _last_physts.rssi[i];
-              p.RxAtrib.snr[i] = _last_physts.snr[i];
-              p.RxAtrib.evm[i] = _last_physts.evm[i];
-            }
-            /* Window aggregates fold CRC-clean frames only (the Jaguar
-             * convention): a garbled frame's cached physts would bias the
-             * means and the active-chain classification.
-             *
-             * _rxq: passive rssi-snr floor + LinkHealth, fed path-A RSSI +
-             * the IE01 average SNR (the all-paths quantity the passive floor
-             * was validated against; per-path SNR goes to _rxpaths instead).
-             * A frame with no IE_01 SNR (snr_avg=0) still counts toward RSSI.
-             * _rxpaths: per-antenna window means (GetActiveRxPaths). Both
-             * dies are 2 RX chains; C/D read 0 and are excluded by n_chains. */
-            if (!f.crc_err) {
-              if (_last_physts.rssi[0] > 0)
-                _rxq.add(_last_physts.rssi[0], _last_physts.snr_avg, 0);
-              _rxpaths.add(p.RxAtrib.rssi, p.RxAtrib.snr, p.RxAtrib.evm, 2);
-            }
-            p.Data = std::span<uint8_t>(const_cast<uint8_t *>(f.payload),
-                                        f.payload_len);
-            packetProcessor(p);
-          } else if (f.rpkt_type == kestrel::RPKT_TYPE_C2H) {
-            handle_c2h(f.payload, f.payload_len);
           }
+          batch.push(f, _variant == kestrel::ChipVariant::C8852C, emit);
           if (f.next_offset == 0)
             break;
           off += f.next_offset;
         }
+        batch.finish(emit);
       },
       /* Stop on StopRxLoop() or the demos' SIGINT/SIGTERM flag — the same
        * signal-flag pattern every generation's RX loop honours (without it the
@@ -567,9 +579,80 @@ void RtlKestrelDevice::FastSetBandwidth(ChannelWidth_t bw) {
 }
 
 void RtlKestrelDevice::SetTxMode(const devourer::TxMode &mode) {
+  std::lock_guard lock(_tx_state_mutex);
   _tx_mode_default = mode;
 }
-void RtlKestrelDevice::ClearTxMode() { _tx_mode_default.reset(); }
+void RtlKestrelDevice::ClearTxMode() {
+  std::lock_guard lock(_tx_state_mutex);
+  _tx_mode_default.reset();
+}
+
+bool RtlKestrelDevice::SetAmpduMode(const devourer::AmpduMode &mode) {
+  if (mode.enabled && (mode.tid > 7 || mode.max_num == 0 ||
+                       mode.density > 7 ||
+                       (!mode.no_ack && (!_cfg.rx.ack_responder ||
+                                         !_cfg.rx.ack_peer))))
+    return false;
+  std::lock_guard lock(_tx_packet_mutex);
+  if (_ba_cam_armed && (!mode.enabled || mode.no_ack ||
+                        mode.tid != _ampdu.tid)) {
+    if (!_hal.configure_ba_responder(_ampdu.tid, false)) return false;
+    _ba_cam_armed = false;
+  }
+  if (mode.enabled && !mode.no_ack && !_ba_cam_armed) {
+    if (!_hal.configure_ba_responder(mode.tid, true)) return false;
+    _ba_cam_armed = true;
+  }
+  uint32_t limit = _device.rtw_read32(kestrel::reg::R_AX_AMPDU_AGG_LIMIT);
+  limit &= ~(kestrel::reg::B_AX_AMPDU_MAX_TIME_MSK
+             << kestrel::reg::B_AX_AMPDU_MAX_TIME_SH);
+  limit |= static_cast<uint32_t>(mode.enabled && mode.max_time
+                                     ? mode.max_time
+                                     : kestrel::reg::PTCL_AMPDU_MAX_TIME_8852B)
+           << kestrel::reg::B_AX_AMPDU_MAX_TIME_SH;
+  _device.rtw_write32(kestrel::reg::R_AX_AMPDU_AGG_LIMIT, limit);
+  _ampdu = mode;
+  _logger->info("Kestrel: A-MPDU {} tid={} max={} density={} time=0x{:02x}",
+                mode.enabled ? "on" : "off", mode.tid, mode.max_num,
+                mode.density, mode.max_time);
+  return true;
+}
+
+void RtlKestrelDevice::ClearAmpduMode() { (void)SetAmpduMode({}); }
+
+bool RtlKestrelDevice::ConfigureAckPeer(const devourer::MacAddr &local,
+                                        const devourer::MacAddr &peer) {
+  const auto valid = [](const devourer::MacAddr &mac) {
+    return (mac.bytes[0] & 1U) == 0 &&
+           std::any_of(mac.bytes.begin(), mac.bytes.end(),
+                       [](std::uint8_t byte) { return byte != 0; });
+  };
+  if (_variant != kestrel::ChipVariant::C8852B || !valid(local) ||
+      !valid(peer) || local.bytes == peer.bytes)
+    return false;
+  if (!_hal.register_ap_role(local.bytes.data()) ||
+      !_hal.set_port_net_type(kestrel::reg::MAC_AX_NET_TYPE_AP))
+    return false;
+  if (!_hal.register_ba_peer_sta(local.bytes.data(), peer.bytes.data(),
+                                 /*macid=*/1, /*addr_cam_idx=*/1))
+    return false;
+  _cfg.rx.ack_responder = local;
+  _cfg.rx.ack_peer = peer;
+  return true;
+}
+
+void RtlKestrelDevice::ClearAckPeer() {
+  (void)_hal.configure_ba_responder(_ampdu.tid, false);
+  (void)_hal.register_sta_role(0, 0, 0);
+  (void)_hal.add_self_sta(kInjectSA, /*macid=*/0);
+  _cfg.rx.ack_responder.reset();
+  _cfg.rx.ack_peer.reset();
+}
+
+devourer::AmpduMode RtlKestrelDevice::GetAmpduMode() {
+  std::lock_guard lock(_tx_packet_mutex);
+  return _ampdu;
+}
 
 devourer::ThermalStatus RtlKestrelDevice::GetThermalStatus() {
   devourer::ThermalStatus s;
@@ -671,6 +754,7 @@ devourer::TxPowerCaps RtlKestrelDevice::GetTxPowerCaps() {
 }
 
 int RtlKestrelDevice::SetTxPowerOffsetQdb(int qdb) {
+  std::lock_guard lock(_tx_state_mutex);
   /* Clamp so the effective power stays in the PA-valid dBm window, then apply
    * the offset (folded into the base at the current channel). Returns the
    * APPLIED qdB (may differ from the request after clamping). */
@@ -896,13 +980,8 @@ devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
    * computed and discarded. No phydm FA/CCA/IGI monitor either. */
   c.busy_airtime_ok = false;
   c.rx_energy_ok = false;
-  /* Hardware ARQ: SetAckResponder is not implemented on the AX generation
-   * (matrix-measured 0% closure) — that flag stays false. The retry knob IS
-   * wired (WD DATA_TXCNT_LMT per frame, attempts-semantics folded to the
-   * N-retries contract in send_packet; witness-measured on the 8832CU:
-   * limits {0,2} -> modal {1,3} on-air copies exactly, limit 8 -> an 8/9
-   * near-tie consistent with ~90% witness capture of a 9-copy truth —
-   * obedient, no wedge). */
+  c.ack_responder_ok = _variant == kestrel::ChipVariant::C8852B &&
+                       _cfg.rx.ack_responder.has_value();
   c.tx_retry_limit_ok = true;
   c.bw_mask = devourer::bw_mask_for_generation(c.generation);
   if (_variant == kestrel::ChipVariant::C8852C)
@@ -959,6 +1038,7 @@ devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
 }
 
 bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
+  std::lock_guard packet_lock(_tx_packet_mutex);
   if (!_tx_up) {
     _logger->error("Kestrel: send_packet before InitWrite (TX not up)");
     return false;
@@ -1001,13 +1081,18 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
         break;
       case IEEE80211_RADIOTAP_MCS: {
         rate_from_radiotap = true;
+        const uint8_t known = it.this_arg[0];
         uint8_t flags = it.this_arg[1];
         if ((flags & IEEE80211_RADIOTAP_MCS_BW_MASK) ==
             IEEE80211_RADIOTAP_MCS_BW_40)
           tr.bw = 1;
         if (flags & 0x04)
           tr.gi_ltf = 1; /* SGI */
-        if (it.this_arg[0] & IEEE80211_RADIOTAP_MCS_HAVE_MCS)
+        if (known & IEEE80211_RADIOTAP_MCS_HAVE_FEC)
+          tr.ldpc = (flags & IEEE80211_RADIOTAP_MCS_FEC_LDPC) != 0;
+        if (known & IEEE80211_RADIOTAP_MCS_HAVE_STBC)
+          tr.stbc = (flags & IEEE80211_RADIOTAP_MCS_STBC_MASK) != 0;
+        if (known & IEEE80211_RADIOTAP_MCS_HAVE_MCS)
           mgn = static_cast<uint8_t>(MGN_MCS0 + it.this_arg[2]);
       } break;
       case IEEE80211_RADIOTAP_VHT: {
@@ -1106,8 +1191,13 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
   /* No per-packet radiotap rate -> apply the SetTxMode default (DEVOURER_TX_RATE)
    * so a rate-less frame (the demo beacon) airs at the requested rate/BW rather
    * than the 6M/20MHz fallback. Mirrors the Jaguar path. */
-  if (!rate_from_radiotap && !he && _tx_mode_default.has_value()) {
-    const devourer::TxMode &m = *_tx_mode_default;
+  std::optional<devourer::TxMode> tx_mode_default;
+  {
+    std::lock_guard lock(_tx_state_mutex);
+    tx_mode_default = _tx_mode_default;
+  }
+  if (!rate_from_radiotap && !he && tx_mode_default.has_value()) {
+    const devourer::TxMode &m = *tx_mode_default;
     if (m.mode == devourer::TxMode::Mode::HE) {
       /* HE expressed natively (tx_mode_to_params has no HE mapping — it would
        * silently fall back to VHT and the frame would air as a VHT_SU PPDU,
@@ -1162,6 +1252,7 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
    * DBM_TX_POWER field is an absolute per-frame level and still wins outright,
    * so a caller can steer a single frame out of the table's shape. */
   {
+    std::lock_guard lock(_tx_state_mutex);
     const int16_t base = _hal.txpwr_base_qdb();
     int eff;
     if (pkt_pwr_db != INT_MIN)
@@ -1201,23 +1292,104 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
   const int rl = _cfg.tx.retry_limit < 0    ? 0
                  : _cfg.tx.retry_limit > 62 ? 62
                                             : _cfg.tx.retry_limit;
-  const int txcnt = rl + 1;
-  auto buf = use_data_q
-                 ? kestrel::build_data_txdesc(frame, flen, tr, 0,
-                                              _tx_seq++ & 0xfff, wd_len, txcnt,
-                                              stf)
-                 : kestrel::build_mgnt_txdesc(frame, flen, tr, 0,
-                                              _tx_seq++ & 0xfff, wd_len, txcnt,
-                                              stf);
+  const bool ampdu = is_data && _ampdu.enabled && flen >= 26 &&
+                     (frame[0] & 0x80) != 0 &&
+                     (frame[24] & 0x0f) == _ampdu.tid;
+  const int txcnt = ampdu && _ampdu.no_ack ? 1 : rl + 1;
+  std::vector<uint8_t> tx_buf;
+  const auto seq = _tx_seq.fetch_add(1, std::memory_order_relaxed) & 0xfff;
+  if (use_data_q) {
+    const uint8_t macid = ampdu && !_ampdu.no_ack ? 1 : 0;
+    kestrel::build_data_txdesc_into(tx_buf, frame, flen, tr, macid, seq, wd_len,
+                                    txcnt, ampdu ? _ampdu.max_num : 0,
+                                    ampdu ? _ampdu.density : 0, stf);
+  } else {
+    kestrel::build_mgnt_txdesc_into(tx_buf, frame, flen, tr, 0, seq, wd_len,
+                                    txcnt, stf);
+  }
   if (use_data_q)
     ep = _tx_data_q;
-  int rc = _device.bulk_send_data_sync_ep(ep, buf.data(),
-                                     static_cast<int>(buf.size()), 1000);
-  if (rc < 0 || static_cast<size_t>(rc) != buf.size()) {
+  if (_tx_usb_agg_active) {
+    if (_tx_usb_agg_count == 0)
+      _tx_usb_agg_ep = ep;
+    else if (ep != _tx_usb_agg_ep)
+      return false;
+    const size_t aligned = (tx_buf.size() + 7u) & ~size_t{7u};
+    const size_t old_size = _tx_usb_agg_buf.size();
+    _tx_usb_agg_buf.resize(old_size + aligned, 0);
+    std::memcpy(_tx_usb_agg_buf.data() + old_size, tx_buf.data(),
+                tx_buf.size());
+    ++_tx_usb_agg_count;
+    return true;
+  }
+  if (_async_tx)
+    return _device.send_packet_ep(ep, tx_buf.data(), tx_buf.size());
+  const int rc = _device.bulk_send_data_sync_ep(ep, tx_buf.data(),
+                                           static_cast<int>(tx_buf.size()), 1000);
+  if (rc < 0 || static_cast<size_t>(rc) != tx_buf.size()) {
     _logger->error("Kestrel: send_packet {} 0x{:02x} failed (rc={}, wanted {})",
                    _device.is_usb() ? "bulk-OUT ep" : "PCIe dma-ch", ep, rc,
-                   buf.size());
+                   tx_buf.size());
     return false;
   }
   return true;
+}
+
+size_t RtlKestrelDevice::send_packets(const TxPacketView *pkts,
+                                      size_t count) {
+  std::lock_guard lock(_tx_packet_mutex);
+  if (pkts == nullptr || count == 0)
+    return 0;
+  /* Vendor usb_init_8852b caps one DMA TX aggregate at AX_TXD_CH_DMA_MSK
+   * (15 WDs). The previous host cap of 8 split every ~25-frame socket batch
+   * across four USB2 transfers. */
+  const size_t max_frames = std::min<size_t>(_cfg.tx.usb_agg_max, 15);
+  if (max_frames < 2)
+    return IRadio::send_packets(pkts, count);
+  /* The AX USB aggregation header is a DMA_TXAGG_NUM field in the first WD;
+   * only same-endpoint data frames can share one bulk transfer. */
+  for (size_t i = 0; i < count; ++i) {
+    if (pkts[i].data == nullptr)
+      return 0;
+    const uint16_t rlen = devourer::radiotap_hdr_len(pkts[i].data, pkts[i].len);
+    if (rlen == 0 || rlen >= pkts[i].len ||
+        !kestrel::frame_is_data(pkts[i].data + rlen, pkts[i].len - rlen))
+      return IRadio::send_packets(pkts, count);
+  }
+  size_t total_accepted = 0;
+  for (size_t begin = 0; begin < count; begin += max_frames) {
+    const size_t end = std::min(count, begin + max_frames);
+    _tx_usb_agg_active = true;
+    _tx_usb_agg_ep = 0;
+    _tx_usb_agg_count = 0;
+    _tx_usb_agg_buf.clear();
+    size_t accepted = 0;
+    for (size_t i = begin; i < end; ++i)
+      if (send_packet(pkts[i].data, pkts[i].len))
+        ++accepted;
+    _tx_usb_agg_active = false;
+    if (accepted == 0) {
+      _tx_usb_agg_buf.clear();
+      continue;
+    }
+    const uint32_t agg_num = std::min<uint16_t>(_tx_usb_agg_count, 0x7f);
+    uint32_t dword1 = 0;
+    std::memcpy(&dword1, _tx_usb_agg_buf.data() + 4, sizeof(dword1));
+    dword1 = (dword1 & ~(0xffu << 8)) | (agg_num << 8);
+    std::memcpy(_tx_usb_agg_buf.data() + 4, &dword1, sizeof(dword1));
+    bool ok = false;
+    if (_async_tx) {
+      ok = _device.send_packet_ep(_tx_usb_agg_ep, _tx_usb_agg_buf.data(),
+                                  _tx_usb_agg_buf.size());
+    } else {
+      const int rc = _device.bulk_send_data_sync_ep(
+          _tx_usb_agg_ep, _tx_usb_agg_buf.data(),
+          static_cast<int>(_tx_usb_agg_buf.size()), 1000);
+      ok = rc >= 0 && static_cast<size_t>(rc) == _tx_usb_agg_buf.size();
+    }
+    if (ok)
+      total_accepted += accepted;
+    _tx_usb_agg_buf.clear();
+  }
+  return total_accepted;
 }

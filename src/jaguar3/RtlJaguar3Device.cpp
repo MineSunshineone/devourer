@@ -122,6 +122,13 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
   _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
                                       iqk_at_20 ? CHANNEL_WIDTH_20
                                                 : channel.ChannelWidth);
+  /* The vendor selects the 8822E 5 GHz TRX/RFE path before RFK.  IQK must see
+   * the final A+B/eFEM route; doing this only after IQK calibrates the wrong
+   * front-end state on 2SS. */
+  if (_variant == jaguar3::ChipVariant::C8822E && channel.Channel > 14) {
+    _hal.config_channel_8822e(channel.Channel);
+    _hal.config_trx_mode_8822e(channel.Channel);
+  }
   SelectedChannel iqk_ch = channel;
   if (iqk_at_20)
     iqk_ch.ChannelWidth = CHANNEL_WIDTH_20; /* IQK command set follows the RF */
@@ -129,9 +136,14 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
   if (iqk_at_20)
     _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
                                         channel.ChannelWidth);
-  _hal.enable_rx_path(); /* RF into RX mode (IGI toggle) — must follow channel set */
-  _hal.config_rfe(channel.Channel); /* 8822e RFE/PAPE antenna-switch pins */
-  _hal.config_channel_8822e(channel.Channel); /* 8822e band TX scaling/backoff + shaping */
+  if (_variant == jaguar3::ChipVariant::C8822E && channel.Channel > 14) {
+    _hal.config_channel_8822e(channel.Channel);
+    _hal.config_trx_mode_8822e(channel.Channel);
+  } else {
+    _hal.enable_rx_path();
+    _hal.config_rfe(channel.Channel);
+    _hal.config_channel_8822e(channel.Channel);
+  }
   _hal.coex_wlan_only_init(); /* lock antenna to WLAN (disable BT/LTE coex) */
   /* 8822E DPDT/eFEM pin-mux — post-coex, so an RX-only session also gets both
    * receive chains (GPIO13 -> RFE engine). Kernel parity: _efem_pinmux_config
@@ -139,6 +151,7 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
    * bring-up's copy of this call. No-op on non-8822E. */
   apply_dpdt_route_8822e();
   _brought_up = true;
+  _hal.configure_tssi(channel.Channel);
 
   /* DEVOURER_XTAL_CAP — crystal-cap trim (issue #217, narrowband CFO lever). */
   if (_cfg.tuning.xtal_cap)
@@ -796,6 +809,14 @@ void RtlJaguar3Device::apply_dpdt_route_8822e() {
   }
 }
 
+void RtlJaguar3Device::reapply_8822e_5g_path(uint8_t channel) {
+  if (_variant != jaguar3::ChipVariant::C8822E || channel <= 14)
+    return;
+  _hal.config_channel_8822e(channel);
+  _hal.config_trx_mode_8822e(channel);
+  apply_dpdt_route_8822e();
+}
+
 /* Golden-init replay — same file format as Jaguar2's ("%x %u %llx" = addr
  * width value per line, tests/decode_wseq.py output). */
 void RtlJaguar3Device::apply_replay_wseq() {
@@ -943,6 +964,12 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
   _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
                                       iqk_at_20 ? CHANNEL_WIDTH_20
                                                 : channel.ChannelWidth);
+  /* Match the vendor RFK order: tune the 5 GHz channel and select both RF
+   * paths/RFE before IQK, then reapply the path below for the final state. */
+  if (_variant == jaguar3::ChipVariant::C8822E && channel.Channel > 14) {
+    _hal.config_channel_8822e(channel.Channel);
+    _hal.config_trx_mode_8822e(channel.Channel);
+  }
   SelectedChannel iqk_ch = channel;
   if (iqk_at_20)
     iqk_ch.ChannelWidth = CHANNEL_WIDTH_20; /* IQK command set follows the RF */
@@ -952,11 +979,19 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
   if (iqk_at_20)
     _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
                                         channel.ChannelWidth);
-  if (want_rx)
-    _hal.enable_rx_path(); /* RF into RX mode — same slot as the Init path */
+  const bool eu_5g = _variant == jaguar3::ChipVariant::C8822E &&
+                     channel.Channel > 14;
+  /* The vendor calls phydm_api_trx_mode for TX-only too: it is the shared
+   * TRX-path setup, not merely an RX enable.  In particular, 8822C needs its
+   * 0x820/0x1e2c/CCK TX routing before a 2SS descriptor can use both chains. */
+  if (!eu_5g)
+    _hal.enable_rx_path(); /* full TRX route; RX filters close below if unused */
   _hal.dpk_force_bypass_8822e(); /* 8822e rfe 21/22: kernel bypasses DPK (after IQK) */
-  _hal.config_rfe(channel.Channel); /* 8822e RFE/PAPE antenna-switch pins (PA enable) */
+  if (!eu_5g)
+    _hal.config_rfe(channel.Channel);
   _hal.config_channel_8822e(channel.Channel); /* 8822e band TX scaling/backoff + shaping */
+  if (eu_5g)
+    _hal.config_trx_mode_8822e(channel.Channel);
   timer.stage("rx_path_rfe_channel");
 
   /* DEVOURER_CW_TONE — a bare RF LO carrier. Armed HERE (before the FW power-mode
@@ -1011,6 +1046,7 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
    * re-apply at the end of this function; this early one just keeps the
    * intermediate bring-up steps on sane references. */
   apply_tx_power_current(/*full=*/true);
+  _hal.configure_tssi(channel.Channel);
   timer.stage("txpower_pre");
   _brought_up = true; /* provisional — see BroughtUpGuard above */
   /* WiFi-only coex bring-up: disable the BT/LTE antenna arbitration and lock the
@@ -1163,6 +1199,8 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
    * that thread's register and H2C traffic as bring-up. */
   timer.total();
   _coex_thread = std::thread([this] { coex_runtime_loop(); });
+  if (_cfg.tx.power_index)
+    SetTxPowerIndexOverride(*_cfg.tx.power_index);
   if (_cfg.rx.ack_responder &&
       !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
     throw std::runtime_error(
@@ -1528,6 +1566,7 @@ void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
    * layout comments them out). */
   _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
                     std::memory_order_relaxed);
+  reapply_8822e_5g_path(channel.Channel);
   /* Runtime TX-power knobs in use: re-fold them against the NEW channel
    * group's efuse refs (8822E bases are per-group). Gated on a knob being
    * active so the legacy no-knob path stays byte-identical. */
@@ -1535,6 +1574,8 @@ void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
     _pwr_ref_valid = false;
   if (_brought_up && (_tx_pwr_offset_steps != 0 || _tx_pwr_override >= 0))
     apply_tx_power_current(/*full=*/true);
+  if (_brought_up && _variant == jaguar3::ChipVariant::C8822E)
+    _hal.configure_tssi(channel.Channel);
   /* dis_cca is sticky — the channel set rewrote the BB CCA registers, so
    * re-assert the disable if it was armed. */
   if (_brought_up && (_cca_primary_disabled || _cca_edcca_disabled))
@@ -1561,6 +1602,7 @@ void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
   if (_radioManagement.fast_retune(channel, _channel.ChannelOffset,
                                    _channel.ChannelWidth, cache_rf)) {
     _channel.Channel = channel;
+    reapply_8822e_5g_path(channel);
     /* Only the fw fast path (DEVOURER_FASTRETUNE_FW=2) accepts a band
      * change; the firmware retunes the chip but power folding is host-side —
      * re-fold active knobs against the new band's tables (the same gating
@@ -1568,6 +1610,8 @@ void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
     if (band_change && _brought_up &&
         (_tx_pwr_offset_steps != 0 || _tx_pwr_override >= 0))
       apply_tx_power_current(/*full=*/true);
+    if (_brought_up && _variant == jaguar3::ChipVariant::C8822E)
+      _hal.configure_tssi(channel);
     return;
   }
   /* Fast path declined (band change / never tuned) — full channel set at the
@@ -1575,6 +1619,9 @@ void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
   _channel.Channel = channel;
   _radioManagement.set_channel_bwmode(channel, _channel.ChannelOffset,
                                       _channel.ChannelWidth);
+  reapply_8822e_5g_path(channel);
+  if (_brought_up && _variant == jaguar3::ChipVariant::C8822E)
+    _hal.configure_tssi(channel);
 }
 
 void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
@@ -1598,6 +1645,7 @@ void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
       _radioManagement.fast_set_bandwidth(bw)) {
     _channel.ChannelWidth = bw;
     _rx_bw_code.store(channel_width_to_bw_code(bw), std::memory_order_relaxed);
+    reapply_8822e_5g_path(_channel.Channel);
     return;
   }
   /* Fast path declined (40/80 endpoint, cold radio) — full channel set, under
@@ -1606,6 +1654,7 @@ void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
                                       bw);
   _channel.ChannelWidth = bw;
   _rx_bw_code.store(channel_width_to_bw_code(bw), std::memory_order_relaxed);
+  reapply_8822e_5g_path(_channel.Channel);
 }
 
 /* Re-program TXAGC from the current knob state (see header). Both TXAGC
@@ -1647,8 +1696,9 @@ void RtlJaguar3Device::apply_tx_power_current(bool full) {
      * devourer falls back to JAGUAR3_TXPWR_REF_BASE — an empirically
      * on-air-matched default that is not below the kernel's. The per-rate
      * diffs come from the BB phy_reg_pg table (apply_power_by_rate_8822e);
-     * full TSSI-offset power-by-rate is a follow-up. The derived base refs
-     * are cached so an offset-only step is just the light ref writes. */
+     * Halrf8822e also programs the vendor logical-efuse TSSI DE and 84-entry
+     * codeword table after bring-up; the derived base refs are cached so an
+     * offset-only step is just the light ref writes. */
     if (full || !_pwr_ref_valid) {
       uint8_t efuse_a = 0xFF, efuse_b = 0xFF;
       _hal.read_efuse_txpwr_base_8822e(_channel.Channel, efuse_a, efuse_b);
@@ -1690,8 +1740,11 @@ void RtlJaguar3Device::apply_tx_power_current(bool full) {
     }
     return;
   }
-  _radioManagement.set_tx_power_ref(rc, /*zero_diffs=*/!_diffs_zeroed);
-  _diffs_zeroed = true;
+  if (full || _diffs_zeroed)
+    _radioManagement.apply_power_by_rate_8822e(_channel.Channel, rc, rc);
+  else
+    _radioManagement.apply_tx_power_refs(rc, rc);
+  _diffs_zeroed = false;
 }
 
 devourer::TxPowerCaps RtlJaguar3Device::GetTxPowerCaps() {
@@ -1865,7 +1918,7 @@ int RtlJaguar3Device::SetTxPacketPowerOffsetQdb(int qdb) {
 }
 
 devourer::TxCaps RtlJaguar3Device::GetTxCaps() {
-  return devourer::tx_caps_for_chains(2); /* 8822C/8822E are 2T2R */
+  return devourer::tx_caps_for_chains(_hal.tx_chain_limit());
 }
 
 int RtlJaguar3Device::SetXtalCap(int cap) {
@@ -1890,7 +1943,7 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
   c.transport = _device.is_usb() ? "usb" : "pcie";
   c.tx = GetTxCaps();
   c.txpwr = GetTxPowerCaps();
-  c.tx_chains = 2; /* 8822C/8822E are 2T2R */
+  c.tx_chains = _hal.tx_chain_limit();
   c.rx_chains = 2;
   c.per_chain_rssi = true;
   /* CCX CLM via NhmReader's JGR3 map; separated arm-vs-quiet on air (#431). */
@@ -2529,12 +2582,14 @@ size_t RtlJaguar3Device::send_packets(const TxPacketView *pkts, size_t count) {
       _logger->error("8822C aggregated TX short on EP 0x{:02x}: {}/{} "
                      "({} frames dropped)",
                      agg_ep, rc, urb.size(), plan.frames());
-    devourer::Ev(_logger->events(), "tx.agg")
-        .f("frames", (unsigned long long)plan.frames())
-        .f("bytes", (unsigned long long)urb.size())
-        .f("sent", (long long)rc)
-        .f("shim", plan.shim)
-        .f("ok", sent_all);
+    if (!sent_all) {
+      devourer::Ev(_logger->events(), "tx.agg")
+          .f("frames", (unsigned long long)plan.frames())
+          .f("bytes", (unsigned long long)urb.size())
+          .f("sent", (long long)rc)
+          .f("shim", plan.shim)
+          .f("ok", false);
+    }
     if (sent_all)
       ok += plan.frames();
     done += plan.frames();
@@ -2953,6 +3008,19 @@ void RtlJaguar3Device::ClearAckResponder() {
   }
   _logger->info("Jaguar3: hardware ACK responder disarmed (net_type=NoLink)");
 }
+
+bool RtlJaguar3Device::ConfigureAckPeer(const devourer::MacAddr &local,
+                                        const devourer::MacAddr &peer) {
+  const auto valid = [](const devourer::MacAddr &mac) {
+    return (mac.bytes[0] & 1U) == 0 &&
+           std::any_of(mac.bytes.begin(), mac.bytes.end(),
+                       [](std::uint8_t byte) { return byte != 0; });
+  };
+  if (!valid(local) || !valid(peer) || local.bytes == peer.bytes) return false;
+  return SetAckResponder(local);
+}
+
+void RtlJaguar3Device::ClearAckPeer() { ClearAckResponder(); }
 
 bool RtlJaguar3Device::SetAmpduMode(const devourer::AmpduMode &mode) {
   /* A-MPDU TX mode (src/AmpduMode.h): record the descriptor state the TX path

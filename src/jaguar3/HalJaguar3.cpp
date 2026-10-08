@@ -113,6 +113,8 @@ void HalJaguar3::rtw_hal_init(SelectedChannel channel) {
     /* Efuse thermal baseline (0xd0/0xd1) + channel for pwr_track thermal tracking. */
     _cal->set_pwr_track_ctx(_efuse_cache[0xd0], _efuse_cache[0xd1],
                             channel.Channel);
+  if (_variant == ChipVariant::C8822E && _efuse_cache_valid)
+    _cal->set_tssi_efuse_map(_efuse_cache, sizeof(_efuse_cache));
   _phy_ctx.rfe_type = read_efuse_rfe_type(); /* EEPROM_RFE_OPTION (0xCA) */
   /* RTL8822E RFE default. The 8822E phydm BB/AGC/RF tables are keyed by rfe_type;
    * the only rfe values the 8822E front-end logic (phydm_rfe_8822e) handles are
@@ -122,8 +124,10 @@ void HalJaguar3::rtw_hal_init(SelectedChannel channel) {
    * kernel 8822eu driver showed the rfe-21 antenna-switch pins 0x1840/0x1844/
    * 0x4140/0x4144 zeroed). Default to 21 (the kernel's effective value for this
    * module) so the correct front-end table blocks apply. 8822C is unaffected. */
-  if (_variant == ChipVariant::C8822E &&
-      (_phy_ctx.rfe_type == 0 || _phy_ctx.rfe_type == 0xff))
+  if (_cfg.tuning.rfe_type)
+    _phy_ctx.rfe_type = *_cfg.tuning.rfe_type;
+  else if (_variant == ChipVariant::C8822E &&
+           (_phy_ctx.rfe_type == 0 || _phy_ctx.rfe_type == 0xff))
     _phy_ctx.rfe_type = 21;
   _logger->info("Jaguar3: rfe_type=0x{:02x}", _phy_ctx.rfe_type);
   timer.stage("efuse_rfe");
@@ -222,11 +226,30 @@ void HalJaguar3::dpk_force_bypass_8822e() {
                 _phy_ctx.rfe_type);
 }
 
-/* Port of phydm_rfe_8822e (phydm_hal_api8822e.c): drive the external RFE control
- * pins (antenna switch + PAPE/PA-enable). Only rfe_type 21..24 are handled by the
- * vendor; for other rfe the function is a no-op (and the 8822C has no equivalent).
- * The path selection collapses to BB_PATH_NON for 2G rfe21/22 and 5G rfe23/24. */
+/* Port of phydm_rfe_8822c/8822e: drive the external RFE control pins (antenna
+ * switch + PAPE/PA-enable) after channel and TRX-path selection. */
 void HalJaguar3::config_rfe(uint8_t channel) {
+  if (_variant == ChipVariant::C8822C) {
+    /* Official phydm_rfe_8822c: RFE 21/22 use these two BB pin tables. On
+     * 2.4 GHz the vendor deliberately forces BB_PATH_NON; on 5 GHz preserve
+     * a single-path selection and otherwise use AB. */
+    if (_phy_ctx.rfe_type != 21 && _phy_ctx.rfe_type != 22)
+      return;
+    uint32_t path = 0; /* BB_PATH_NON for 2.4 GHz */
+    if (channel > 14) {
+      const uint32_t tx = (_trx_path_bmp >> 4) & 0x3u;
+      const uint32_t rx = _trx_path_bmp & 0x3u;
+      path = (tx == 1 && rx == 1) ? 1 :
+             (tx == 2 && rx == 2) ? 2 : 3;
+    }
+    const uint32_t rfe1840 = path == 1 || path == 3 ? 0x2300 : 0x7770;
+    const uint32_t rfe4144 = path == 2 || path == 3 ? 0x2030 : 0x7077;
+    _device.phy_set_bb_reg(0x1840, 0x0000ffff, rfe1840);
+    _device.phy_set_bb_reg(0x4144, 0x0000ffff, rfe4144);
+    _logger->info("Jaguar3(8822c): RFE pins set (rfe={} ch={} path={})",
+                  _phy_ctx.rfe_type, channel, path);
+    return;
+  }
   if (_variant != ChipVariant::C8822E)
     return;
   const uint8_t rfe = _phy_ctx.rfe_type;
@@ -330,36 +353,167 @@ void HalJaguar3::config_channel_8822e(uint8_t channel) {
                 channel, is_2g ? 2 : 5);
 }
 
-/* Port of phydm config_trx_mode's RX half (phydm_hal_api8822c.c), BB_PATH_AB.
- * Shared 8822c/8822e — these BB/RF-path functions are byte-identical across the
- * two generations. devourer applied the BB table (which carries some RX-path
- * defaults) and enable_tx_path, but never ran this runtime RX-path config nor
- * the IGI toggle, so the RF HW was never commanded into RX mode and the chip
- * delivered zero frames (kernel rtw88 runs this at hw-start). */
-void HalJaguar3::enable_rx_path() {
+void HalJaguar3::config_trx_mode_8822e(uint8_t channel) {
+  if (_variant != ChipVariant::C8822E || channel <= 14)
+    return;
+
   constexpr uint32_t kAB = 0x3;
 
-  /* --- set_rf_mode_table (rx_path != A => 0x4100 = 0x33312) --- */
+  /* config_phydm_trx_mode_8822e(tx=AB, rx=AB, 1ss=B): RF mode first. */
   _device.phy_set_bb_reg(0x4100, 0x000fffff, 0x33312);
 
-  /* --- config_cck_rx_path (AB) --- */
-  _device.phy_set_bb_reg(0x1a04, 0x0f000000, 0x1); /* antA->CCK1, antB->CCK2 */
-  _device.phy_set_bb_reg(0x1a2c, 1u << 5, 0x0);    /* enable RX clk gated */
-  _device.phy_set_bb_reg(0x1a2c, 0x00060000, 0x1); /* enable MRC CCK barker */
-  _device.phy_set_bb_reg(0x1a2c, 0x00600000, 0x1); /* enable MRC CCK CCA */
-
-  /* --- config_ofdm_rx_path (AB), non-mp branch --- */
-  _device.phy_set_bb_reg(0x0cc0, 0x7ff, 0x400);
+  /* phydm_config_rx_path_8822e: CCK AB, then OFDM AB. */
+  _device.phy_set_bb_reg(0x1a04, 0x0f000000, 0x1);
+  _device.phy_set_bb_reg(0x1a2c, 1u << 5, 0x0);
+  _device.phy_set_bb_reg(0x1a2c, 0x00060000, 0x1);
+  _device.phy_set_bb_reg(0x1a2c, 0x00600000, 0x1);
+  {
+    const uint32_t v = _device.rtw_read32(0x0);
+    _device.rtw_write32(0x0, v | (1u << 16));
+    _device.rtw_write32(0x0, v & ~(1u << 16));
+    _device.rtw_write32(0x0, v | (1u << 16));
+  }
+  _device.phy_set_bb_reg(0x0cc0, 0x000007ff, 0x400);
   _device.phy_set_bb_reg(0x0cc0, 1u << 22, 0x0);
-  _device.phy_set_bb_reg(0x0cc8, 0x7ff, 0x400);
+  _device.phy_set_bb_reg(0x0cc8, 0x000007ff, 0x400);
   _device.phy_set_bb_reg(0x0cc8, 1u << 22, 0x0);
-  _device.phy_set_bb_reg(0x1d30, 0x300, 0x1);       /* ht_mcs_limit */
-  _device.phy_set_bb_reg(0x1d30, 0x600000, 0x1);    /* vht_nss_limit */
-  _device.phy_set_bb_reg(0x0c44, 1u << 17, 0x1);    /* enable antenna weighting */
-  _device.phy_set_bb_reg(0x0c54, 1u << 20, 0x1);    /* htstf ant-wgt enable */
-  _device.phy_set_bb_reg(0x0c38, 1u << 24, 0x1);    /* MRC modified-ZF eqz */
-  _device.phy_set_bb_reg(0x0824, 0x000f0000, kAB);   /* Rx_ant */
-  _device.phy_set_bb_reg(0x0824, 0x0f000000, kAB);   /* Rx_CCA */
+  _device.phy_set_bb_reg(0x1d30, 0x00000300, 0x1);
+  _device.phy_set_bb_reg(0x1d30, 0x00600000, 0x1);
+  _device.phy_set_bb_reg(0x0c44, 1u << 17, 0x1);
+  _device.phy_set_bb_reg(0x0c54, 1u << 20, 0x1);
+  _device.phy_set_bb_reg(0x0c38, 1u << 24, 0x1);
+  _device.phy_set_bb_reg(0x0824, 0x000f0000, kAB);
+  _device.phy_set_bb_reg(0x0824, 0x0f000000, kAB);
+  {
+    const uint32_t v = _device.rtw_read32(0x0);
+    _device.rtw_write32(0x0, v | (1u << 16));
+    _device.rtw_write32(0x0, v & ~(1u << 16));
+    _device.rtw_write32(0x0, v | (1u << 16));
+  }
+  /* phydm_config_tx_path_8822e: 2SS=AB, vendor default 1SS/CCK=B.
+   * 0x32 is intentional: its high nibble selects AB for 2SS; its low nibble
+   * selects B for 1SS. 0x33 would incorrectly force 1SS onto both chains. */
+  _device.phy_set_bb_reg(0x1a04, 0xf0000000, 0x4);
+  {
+    const uint32_t v = _device.rtw_read32(0x0);
+    _device.rtw_write32(0x0, v | (1u << 16));
+    _device.rtw_write32(0x0, v & ~(1u << 16));
+    _device.rtw_write32(0x0, v | (1u << 16));
+  }
+  _device.phy_set_bb_reg(0x820, 0x000000ff, 0x32);
+  _device.phy_set_bb_reg(0x1e2c, 0x0000ffff, 0x0400);
+  {
+    const uint32_t v = _device.rtw_read32(0x0);
+    _device.rtw_write32(0x0, v | (1u << 16));
+    _device.rtw_write32(0x0, v & ~(1u << 16));
+    _device.rtw_write32(0x0, v | (1u << 16));
+  }
+
+  /* phydm_rfe_8822e(BB_PATH_AB), then the final vendor reset + IGI toggle. */
+  config_rfe(channel);
+  {
+    const uint32_t v = _device.rtw_read32(0x0);
+    _device.rtw_write32(0x0, v | (1u << 16));
+    _device.rtw_write32(0x0, v & ~(1u << 16));
+    _device.rtw_write32(0x0, v | (1u << 16));
+  }
+  const uint32_t igi = _device.rtw_read32(0x1d70);
+  _device.rtw_write32(0x1d70, igi - 0x202);
+  _device.rtw_write32(0x1d70, igi);
+  devourer::Ev(_logger->events(), "jaguar3.trx_path")
+      .t()
+      .f("channel", channel)
+      .f("rfe", _phy_ctx.rfe_type)
+      .hexf("rf_mode", _device.rtw_read32(0x4100), 8)
+      .hexf("rx_ofdm", _device.rtw_read32(0x824), 8)
+      .hexf("tx_ofdm", _device.rtw_read32(0x820), 8)
+      .hexf("tx_sel", _device.rtw_read32(0x1e2c), 8)
+      .hexf("cck", _device.rtw_read32(0x1a04), 8)
+      .hexf("rfe1840", _device.rtw_read32(0x1840), 8)
+      .hexf("rfe4140", _device.rtw_read32(0x4140), 8)
+      .hexf("igi", _device.rtw_read32(0x1d70), 8);
+}
+
+/* Port of phydm_config_trx_mode_8822c (phydm_hal_api8822c.c). The vendor call
+ * programs RF mode, RX mapping, TX mapping, RFE pins, then resets the BB and
+ * toggles IGI. The old port only copied the RX half, leaving 0x820/0x1e2c and
+ * CCK TX on reset defaults; that silently reduced 2T2R boards to one stream. */
+void HalJaguar3::enable_rx_path() {
+  constexpr uint32_t kA = 0x1;
+  constexpr uint32_t kB = 0x2;
+  constexpr uint32_t kAB = 0x3;
+  const uint32_t tx_path = ((_trx_path_bmp >> 4) & 0x3u);
+  const uint32_t rx_path = (_trx_path_bmp & 0x3u);
+  const uint32_t tx = tx_path == 0 ? kAB : tx_path;
+  const uint32_t rx = rx_path == 0 ? kAB : rx_path;
+  const uint32_t tx_1ss = tx == kAB ? kA : tx;
+
+  /* --- set_rf_mode_table --- */
+  if (rx == kA)
+    _device.phy_set_bb_reg(0x4100, 0x000fffff,
+                           tx == kA ? 0x00000 : 0x11112);
+  else
+    _device.phy_set_bb_reg(0x4100, 0x000fffff, 0x33312);
+
+  /* --- config_cck_rx_path --- */
+  if (rx == kA) {
+    _device.phy_set_bb_reg(0x1a04, 0x0f000000, 0x0);
+    _device.phy_set_bb_reg(0x1a2c, 1u << 5, 0x0);
+    _device.phy_set_bb_reg(0x1a2c, 0x00060000, 0x0);
+    _device.phy_set_bb_reg(0x1a2c, 0x00600000, 0x0);
+  } else if (rx == kB) {
+    _device.phy_set_bb_reg(0x1a04, 0x0f000000, 0x5);
+    _device.phy_set_bb_reg(0x1a2c, 1u << 5, 0x1);
+    _device.phy_set_bb_reg(0x1a2c, 0x00060000, 0x0);
+    _device.phy_set_bb_reg(0x1a2c, 0x00600000, 0x1);
+  } else {
+    _device.phy_set_bb_reg(0x1a04, 0x0f000000, 0x1);
+    _device.phy_set_bb_reg(0x1a2c, 1u << 5, 0x0);
+    _device.phy_set_bb_reg(0x1a2c, 0x00060000, 0x1);
+    _device.phy_set_bb_reg(0x1a2c, 0x00600000, 0x1);
+  }
+
+  /* --- config_ofdm_rx_path --- */
+  if (rx == kB) {
+    _device.phy_set_bb_reg(0x0cc0, 0x7ff, 0x0);
+    _device.phy_set_bb_reg(0x0cc0, 1u << 22, 0x1);
+    _device.phy_set_bb_reg(0x0cc8, 0x7ff, 0x0);
+    _device.phy_set_bb_reg(0x0cc8, 1u << 22, 0x1);
+  } else {
+    _device.phy_set_bb_reg(0x0cc0, 0x7ff, 0x400);
+    _device.phy_set_bb_reg(0x0cc0, 1u << 22, 0x0);
+    _device.phy_set_bb_reg(0x0cc8, 0x7ff, 0x400);
+    _device.phy_set_bb_reg(0x0cc8, 1u << 22, 0x0);
+  }
+  if (rx == kA || rx == kB) {
+    _device.phy_set_bb_reg(0x1d30, 0x300, 0x0);
+    _device.phy_set_bb_reg(0x1d30, 0x600000, 0x0);
+    _device.phy_set_bb_reg(0x0c44, 1u << 17, 0x0);
+    _device.phy_set_bb_reg(0x0c54, 1u << 20, 0x0);
+    _device.phy_set_bb_reg(0x0c38, 1u << 24, 0x0);
+    _device.phy_set_bb_reg(0x0824, 0x000f0000, rx);
+    _device.phy_set_bb_reg(0x0824, 0x0f000000, rx);
+  } else {
+    _device.phy_set_bb_reg(0x1d30, 0x300, 0x1);
+    _device.phy_set_bb_reg(0x1d30, 0x600000, 0x1);
+    _device.phy_set_bb_reg(0x0c44, 1u << 17, 0x1);
+    _device.phy_set_bb_reg(0x0c54, 1u << 20, 0x1);
+    _device.phy_set_bb_reg(0x0c38, 1u << 24, 0x1);
+    _device.phy_set_bb_reg(0x0824, 0x000f0000, kAB);
+    _device.phy_set_bb_reg(0x0824, 0x0f000000, kAB);
+  }
+
+  /* --- config_cck/ofdm_tx_path --- */
+  _device.phy_set_bb_reg(0x1a04, 0xf0000000,
+                         tx_1ss == kB ? 0x4 : 0x8);
+  if (tx == kAB) {
+    _device.phy_set_bb_reg(0x820, 0xff,
+                           tx_1ss == kB ? 0x32 : 0x31);
+    _device.phy_set_bb_reg(0x1e2c, 0xffff, 0x0400);
+  } else {
+    _device.phy_set_bb_reg(0x820, 0xff, tx == kB ? 0x2 : 0x1);
+    _device.phy_set_bb_reg(0x1e2c, 0xffff, 0x0);
+  }
 
   /* --- bb_reset: toggle MAC 0x0[16] 1->0->1 --- */
   for (uint32_t v : {1u, 0u, 1u}) {
@@ -374,7 +528,8 @@ void HalJaguar3::enable_rx_path() {
   _device.rtw_write32(0x1d70, igi - 0x202);
   _device.rtw_write32(0x1d70, igi);
 
-  _logger->info("Jaguar3: RX path enabled (rf-mode + cck/ofdm rx-path + IGI toggle)");
+  _logger->info("Jaguar3: TRX path enabled (bmp=0x{:02x} tx=0x{:x} rx=0x{:x})",
+                _trx_path_bmp, tx, rx);
 }
 
 /* Port of rtl8822c_phy_bf_init (hal/rtl8822c/rtl8822c_phy.c): beamforming /
@@ -802,10 +957,23 @@ void HalJaguar3::cache_efuse_8822e() {
   read_efuse_logical_map(map, sizeof(map));
   std::memcpy(_efuse_cache, map, sizeof(_efuse_cache));
   _efuse_cache_valid = true;
+  /* Vendor rtl8822e_ops.c: EEPROM_RF_BOARD_OPTION_8822E (0xC1) BIT2
+   * marks a board de-featured to one TX stream. 0xFF is unprogrammed and
+   * retains the chip's normal 2T2R capability. */
+  const uint8_t board_option = _efuse_cache[0xC1];
+  _tx_chain_limit = (board_option != 0xFF && (board_option & 0x04u)) ? 1 : 2;
+  /* Machine-readable because production builds intentionally compile human
+   * INFO logs out. This is the raw vendor state needed to distinguish a
+   * de-featured module from a broken 2SS path. */
+  devourer::Ev(_logger->events(), "jaguar3.efuse")
+      .hexf("rfe_option", _efuse_cache[0xCA], 2)
+      .hexf("board_option", board_option, 2)
+      .f("tx_chains", _tx_chain_limit);
   std::memcpy(_perm_mac, map + kMacLogicalOff, sizeof(_perm_mac));
   _perm_mac_valid = mac_programmed(_perm_mac);
-  _logger->info("Jaguar3(8822e): efuse decoded (0x22={:x} 0x4c={:x} 0xca={:x})",
-                _efuse_cache[0x22], _efuse_cache[0x4c], _efuse_cache[0xca]);
+  _logger->info("Jaguar3(8822e): efuse decoded (0x22={:x} 0x4c={:x} 0xca={:x} 0xc1={:x} tx_chains={})",
+                _efuse_cache[0x22], _efuse_cache[0x4c], _efuse_cache[0xca],
+                board_option, _tx_chain_limit);
   if (_perm_mac_valid)
     _logger->info("Jaguar3(8822e): efuse MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                   _perm_mac[0], _perm_mac[1], _perm_mac[2], _perm_mac[3],
@@ -834,14 +1002,33 @@ bool HalJaguar3::perm_mac(uint8_t out[6]) {
 
 uint8_t HalJaguar3::read_efuse_rfe_type() {
   constexpr uint16_t kRfeLogicalOff = 0x00CA;
+  constexpr uint16_t kTrxPathLogicalOff = 0x00C9;
+  auto accept_trx_path = [this](uint8_t path) {
+    switch (path) {
+    case 0x33: /* 2T2R */
+    case 0x13: /* 1T2R, TX-A */
+    case 0x23: /* 1T2R, TX-B */
+    case 0x11: /* 1T1R, path-A */
+    case 0x22: /* 1T1R, path-B */
+      _trx_path_bmp = path;
+      return;
+    default:
+      return;
+    }
+  };
   uint8_t rfe;
   if (_efuse_cache_valid) {
     rfe = _efuse_cache[kRfeLogicalOff];
   } else {
     uint8_t map[0x100 + 0x40]; /* enough to cover block holding 0xCA */
     read_efuse_logical_map(map, sizeof(map));
+    if (_variant == ChipVariant::C8822C)
+      accept_trx_path(map[kTrxPathLogicalOff]);
     rfe = map[kRfeLogicalOff];
   }
+  if (_variant == ChipVariant::C8822C)
+    _logger->info("Jaguar3(8822C): eFuse trx_path=0x{:02x} rfe=0x{:02x}",
+                  _trx_path_bmp, rfe);
   return (rfe == 0xFF) ? 0 : rfe;
 }
 

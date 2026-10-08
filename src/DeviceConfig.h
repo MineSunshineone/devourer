@@ -192,6 +192,7 @@ struct DeviceConfig {
      * address is opt-in; some dies, notably RTL8733B, may already answer for
      * the initialization MAC before this option is set. */
     std::optional<MacAddr> ack_responder;
+    std::optional<MacAddr> ack_peer; /* AX BA CAM associated-peer identity */
   } rx;
 
   /* ---- TX ------------------------------------------------------------- */
@@ -223,7 +224,7 @@ struct DeviceConfig {
     /* env: DEVOURER_TX_LEGACY_8812_DESC — 8814A: keep the legacy 8812-style
      * TX-descriptor bits instead of the 8814-native layout. */
     bool legacy_8812_desc = false;
-    /* env: DEVOURER_TX_PWR — Jaguar2: flat TXAGC index (0..63) applied at the
+    /* env: DEVOURER_TX_PWR — Jaguar2/3: flat TXAGC index (0..63) applied at the
      * end of InitWrite via SetTxPowerIndexOverride (composes with the offset
      * knob and shows up in GetTxPowerState). Debug/SDR-visibility knob. */
     std::optional<int> power_index;
@@ -359,6 +360,8 @@ struct DeviceConfig {
     bool skip_trx_reassert = false; /* env: DEVOURER_SKIP_TRX_REASSERT (J2) */
     bool skip_rfe_init = false;     /* env: DEVOURER_SKIP_RFEINIT (J2) */
     bool skip_coex = false;         /* env: DEVOURER_SKIP_COEX (J2) */
+    bool kestrel_bt_grant = false;  /* env: DEVOURER_KESTREL_BT_GRANT;
+                                     * 8852B combo board with BT antenna */
     bool skip_dig = false;          /* env: DEVOURER_SKIP_DIG (J2) */
     /* env: DEVOURER_THERMAL_TRACK — Jaguar2 thermal TX-power tracking
      * (default ON; "0" disables). A ~2 s tick reads the RF 0x42 thermal
@@ -417,7 +420,7 @@ struct DeviceConfig {
      * tx_pwr_ofst step will be 1dB", phydm.h bb_ram block); override for
      * bench slope calibration (tests/txpkt_pwr_ofset_onair.sh). */
     int txpkt_step_qdb = 4;
-    /* env: DEVOURER_RFE — Jaguar2 RFE type override (antenna/LNA switch
+    /* env: DEVOURER_RFE — Jaguar2/Jaguar3 RFE type override (antenna/LNA switch
      * variant; unset = efuse, blank efuse falls back per vendor). */
     std::optional<uint8_t> rfe_type;
     /* env: DEVOURER_NB_DAC — 5/10 MHz divider-mapping experiments only.

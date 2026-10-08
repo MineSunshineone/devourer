@@ -74,7 +74,9 @@ public:
    * CAM entries (0 for the first/self STA). The frame's SA/BSSID resolve from
    * this entry; without it the CMAC cannot build the PPDU. */
   bool fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6], uint8_t net_type,
-                       uint8_t addr_cam_idx, uint8_t bssid_cam_idx);
+                       uint8_t addr_cam_idx, uint8_t bssid_cam_idx,
+                       const uint8_t* target_mac = nullptr,
+                       const uint8_t* bssid = nullptr);
 
   /* mac_upd_cctl_info (tblupd.c): H2C cat=MAC, class=FR_EXCHG, func=CCTLINFO_UD
    * — the per-MACID CMAC control table. Sets the default TX rate, the TX
@@ -83,6 +85,8 @@ public:
    * broadcast/multicast MACID. Read-modify-write (operation=1). */
   bool fw_upd_cctl_basic(uint8_t macid, uint8_t addr_cam_idx, uint16_t datarate,
                          uint8_t ntx_path_en, uint8_t path_map_a, bool bmc);
+
+  bool fw_ba_cam(uint8_t tid, uint8_t macid, uint16_t ssn, bool valid);
 
   /* mac_send_bcn_h2c (beacon.c): H2C cat=MAC, class=FR_EXCHG, func=BCN_UPD_V1 —
    * hand the firmware the full 802.11 beacon body; the fw stores it and airs it

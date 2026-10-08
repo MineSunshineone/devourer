@@ -4,8 +4,10 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include "TxMode.h"
 
@@ -84,6 +86,8 @@ public:
   bool SetCcaGates(bool primary_disabled, bool edcca_disabled) override;
   bool GetCcaGates(bool &primary_disabled, bool &edcca_disabled) override;
   bool send_packet(const uint8_t *packet, size_t length) override;
+  size_t send_packets(const TxPacketView *pkts,
+                      size_t count) override;
   devourer::TxStats GetTxStats() override { return _device.GetTxStats(); }
   SelectedChannel GetSelectedChannel() override { return _channel; }
 
@@ -113,6 +117,7 @@ public:
   int SetTxPowerOffsetQdb(int qdb) override;
   devourer::TxPowerState GetTxPowerState() override;
 
+
   /* Caller-supplied per-rate power shape (src/TxPower.h). This family has no
    * per-rate TXAGC table, so the diff for the frame's own rate folds into the
    * fixed-dBm target inside send_packet — see the two consequences documented
@@ -127,6 +132,12 @@ public:
    * wins. Mirrors the Jaguar behaviour so DEVOURER_TX_RATE works uniformly. */
   void SetTxMode(const devourer::TxMode &mode) override;
   void ClearTxMode() override;
+  bool SetAmpduMode(const devourer::AmpduMode &mode) override;
+  void ClearAmpduMode() override;
+  devourer::AmpduMode GetAmpduMode() override;
+  bool ConfigureAckPeer(const devourer::MacAddr &local,
+                        const devourer::MacAddr &peer) override;
+  void ClearAckPeer() override;
 
   /* 64-bit free-running MAC TSF (band-0 port-0). mac_get_tsf (twt.c). */
   uint64_t ReadTsf() override;
@@ -247,24 +258,25 @@ private:
   volatile bool _wp_drain_stop = true;
   void start_wp_drain();
   void stop_wp_drain();
-  /* PCIe: stop the HAXI DMA engine + clear the ring indices (HalKestrel::
-   * pcie_deinit) exactly once, from Stop() or the destructor, whichever comes
-   * first — an RX-only session has the RXQ DMA live too, and the transport
-   * unmaps the slab right after the device goes away. No-op on USB. */
+  /* PCIe: quiesce DMA before the transport unmaps its rings. */
   void pcie_quiesce();
   bool _pcie_quiesced = false;
-  /* True while StartRxLoop's reap loop runs; pcie_quiesce waits for it to
-   * clear (bounded) so the DMA stop never races a reap in progress. */
   std::atomic<bool> _rx_running{false};
-  /* TX queue handles, bus-neutral: on USB the bulk-OUT endpoint (B0MG =
-   * BULKOUTID0, ACH0 = BULKOUTID3), on PCIe the AX DMA channel itself (8, 0).
-   * ACH0 is channel 0, so "TX is up" is its own flag, not a non-zero handle. */
   bool _tx_up = false;
-  bool _brought_up = false; /* Init/InitWrite completed the MAC bring-up */
+  bool _brought_up = false;
   uint8_t _tx_mgmt_q = 0;
   uint8_t _tx_data_q = 0;
-  bool _tx_data_ok = false; /* data frames may use _tx_data_q */
-  uint16_t _tx_seq = 0;    /* rolling 12-bit wifi sequence for injected frames */
+  bool _tx_data_ok = false;
+  std::atomic<uint16_t> _tx_seq{0};
+  std::recursive_mutex _tx_packet_mutex;
+  bool _tx_usb_agg_active = false;
+  uint8_t _tx_usb_agg_ep = 0;
+  uint16_t _tx_usb_agg_count = 0;
+  std::vector<uint8_t> _tx_usb_agg_buf;
+  bool _async_tx = false;
+  devourer::AmpduMode _ampdu{};
+  bool _ba_cam_armed = false;
+  mutable std::mutex _tx_state_mutex;
   std::optional<devourer::TxMode> _tx_mode_default; /* SetTxMode default */
   int16_t _sess_pwr_qdb = 0; /* offset applied by SetTxPowerOffsetQdb — the
                               * restore target for frames without a radiotap
@@ -281,11 +293,6 @@ private:
    *     (a fixed-rate stream pays once and then nothing). */
   std::atomic<bool> _rate_diffs_on{false};
   std::atomic<int8_t> _rate_diff_qdb[10]{};
-  /* Per-path RSSI/SNR/EVM (rx_pkt_attrib raw conventions) parsed from the last
-   * PPDU-status physts blob (kestrel::parse_physts_8852), attached to the
-   * following WIFI frame(s) in the aggregate. snr_avg (raw dB*2, IE01) feeds
-   * the passive noise floor (rssi_dbm - snr_db). 0 = not measured. */
-  kestrel::KestrelPhySts _last_physts{};
   /* Windowed RX link-quality accumulator (passive noise floor + LinkHealth),
    * fed per decoded frame from the RX loop; drained by GetRxQuality. */
   devourer::RxQualityAccumulator _rxq;

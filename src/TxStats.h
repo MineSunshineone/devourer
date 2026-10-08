@@ -30,6 +30,8 @@ constexpr int kTxShortWriteRc = -1000;
 struct TxStats {
   uint64_t submitted = 0;
   uint64_t failed = 0;
+  uint64_t async_completed = 0; /* bulk-OUT callbacks reaped, including failures */
+  uint32_t async_inflight = 0;  /* submitted bulk-OUT callbacks still pending */
   int last_error_rc = 0;      /* raw libusb rc / negated transfer status /
                                * kTxShortWriteRc */
   bool last_was_timeout = false;

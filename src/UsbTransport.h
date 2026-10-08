@@ -120,6 +120,11 @@ public:
   TxStats tx_stats() const override;
 
 private:
+  /* libusb permits multiple transfers on a context, but this backend's
+   * synchronous bulk-OUT path shares one handle/endpoint and one data toggle.
+   * Serialize it across Devourer's TX feeder threads. */
+  std::mutex _tx_sync_mu;
+
   template <typename T> T ctrl_read(uint16_t reg);
   template <typename T> bool ctrl_write(uint16_t reg, T value);
   /* Pipelined-write machinery (see ITransport::write_batch_begin). */
@@ -233,6 +238,7 @@ private:
    * The async transfer_callback increments them from the libusb event thread. */
   std::atomic<uint64_t> _tx_submitted{0};
   std::atomic<uint64_t> _tx_failed{0};
+  std::atomic<uint64_t> _tx_async_completed{0};
   std::atomic<int> _tx_last_rc{0};
   std::atomic<bool> _tx_last_timeout{false};
 

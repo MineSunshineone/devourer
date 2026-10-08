@@ -1,5 +1,9 @@
 #include "Halrf8822e.h"
+#include <algorithm>
 #include <cstdlib>
+#include <iterator>
+
+#include "../../hal/phydm/rtl8822e/Hal8822e_PhyTables.h"
 
 #include <chrono>
 #include <cstdio>
@@ -1054,9 +1058,426 @@ void Halrf8822e::iqk_init() {
   }
 }
 
+void Halrf8822e::rx_spur_k(uint8_t channel) {
+  /* halrf_rxspurk_8822e has two paths: channels with no known spur simply use
+   * the vendor's fixed notch index; the PSD sweep is only for 151/153/155,
+   * 159/161/167/169/171.  149/157 (the H09 working channels) are the fixed
+   * path, so do not run a 12 ms scan while the link is starting. */
+  const bool sweep = channel == 151 || channel == 153 || channel == 155 ||
+                     channel == 159 || channel == 161 || channel == 167 ||
+                     channel == 169 || channel == 171;
+  if (!sweep) {
+    bb_set(0x1814, 1u << 30, 1);
+    bb_set(0x4114, 1u << 30, 1);
+    bb_set(0x2c, 0x0001e000, 8);
+    _logger->info("Jaguar3(8822e): RX Spur K fixed (ch={} idx=8)", channel);
+    return;
+  }
+
+  const uint32_t save_824 = bb_get(0x824, 0x000f0000);
+  const uint32_t save_1b1c = bb_read(0x1b1c);
+  const uint32_t save_1d58 = bb_read(0x1d58);
+  const uint32_t save_1c38 = bb_read(0x1c38);
+  const uint32_t save_rf0b = rf_read(1, 0x00, RFREG_MASK);
+  uint32_t psd[24] = {};
+  constexpr uint8_t start = 4;
+  constexpr uint8_t end = 16;
+  const uint32_t spur = channel == 151 || channel == 159 || channel == 167
+                            ? 0x20
+                            : channel == 153 || channel == 161 || channel == 169
+                                  ? 0x3e0
+                                  : 0x3a0;
+
+  bb_set(0x1d58, 0x00000ff8, 0x1ff);
+  bb_set(0x824, 0x000f0000, 3);
+  bb_set(0x1e24, 0x00020000, 1);
+  bb_set(0x1cd0, 0xF0000000, 0x7);
+  bb_set(0x4164, 0x80000000, 1);
+  bb_set(0x410c, 0x08000000, 1);
+  bb_set(0x416c, 0x00000080, 1);
+  bb_set(0x410c, 0x00000003, 0);
+  bb_set(0x1a00, 0x00000003, 2);
+  bb_write(0x1b08, 0x00000080);
+  bb_write(0x1c38, 0x00000000);
+  bb_write(0x1c38, 0xffffffffu);
+  const uint32_t gnt = btc_read_indirect(0x38);
+  iqk_set_gnt_wl_high();
+  rf_write(1, 0x00, RFREG_MASK, 0x31daf);
+
+  auto sample = [&](uint8_t idx, bool pll) {
+    bb_set(0x1814, 1u << 30, pll ? 1 : 0);
+    bb_set(0x4114, 1u << 30, pll ? 1 : 0);
+    bb_set(0x2c, 0x0001e000, idx);
+    bb_write(0x1b2c, 0x00000010 | (spur << 16));
+    bb_write(0x1b34, 1);
+    bb_write(0x1b34, 0);
+    delay_us(500);
+    bb_write(0x1bd4, 0x00250001);
+    const uint32_t hi = bb_get(0x1bfc, 0x07ff0000);
+    bb_write(0x1bd4, 0x002e0001);
+    const uint32_t lo = bb_read(0x1bfc);
+    return ((hi << 21) + (lo >> 11)) & 0xffffffffu;
+  };
+  for (uint8_t i = start; i < end; ++i)
+    psd[i - start] = sample(i, false);
+  for (uint8_t i = start; i < end; ++i)
+    psd[12 + i - start] = sample(i, true);
+  btc_write_indirect(0x38, 0xffffffffu, gnt);
+
+  uint8_t min_idx = 8;
+  uint32_t min_value = 0xffffffffu;
+  uint8_t min = 0;
+  bool any = false;
+  for (uint8_t i = 0; i < 24; ++i) {
+    if (psd[i] != 0) any = true;
+    if (psd[i] < min_value) {
+      min_value = psd[i];
+      min = i;
+    }
+  }
+  if (any) {
+    min_idx = min < 12 ? static_cast<uint8_t>(start + min)
+                       : static_cast<uint8_t>(start + min - 12);
+    bb_set(0x1814, 1u << 30, min >= 12);
+    bb_set(0x4114, 1u << 30, min >= 12);
+  } else {
+    bb_set(0x1814, 1u << 30, 1);
+    bb_set(0x4114, 1u << 30, 1);
+  }
+  bb_set(0x2c, 0x0001e000, min_idx);
+
+  bb_write(0x1c38, 0);
+  bb_write(0x1c38, save_1c38);
+  bb_set(0x4164, 0x80000000, 0);
+  bb_set(0x410c, 0x08000000, 0);
+  bb_set(0x416c, 0x00000080, 0);
+  bb_set(0x410c, 0x00000003, 3);
+  bb_set(0x1a00, 0x00000003, 0);
+  bb_set(0x1b20, 0x20000000, 1);
+  bb_write(0x1b1c, save_1b1c);
+  bb_set(0x824, 0x000f0000, save_824);
+  bb_set(0x1d58, 0x00000ff8, save_1d58);
+  rf_write(1, 0x00, RFREG_MASK, save_rf0b);
+  _logger->info("Jaguar3(8822e): RX Spur K sweep (ch={} idx={} min=0x{:x})",
+                channel, min_idx, min_value);
+}
+
+void Halrf8822e::rx_dck() {
+  const uint8_t save_522 = mac_read8(0x522);
+  const uint32_t save_1e70 = bb_read(0x1e70);
+  const uint32_t save_180c = bb_read(0x180c);
+  const uint32_t save_410c = bb_read(0x410c);
+  const uint32_t gnt = btc_read_indirect(0x38);
+  bb_set(0x180c, 0x3, 0);
+  bb_set(0x410c, 0x3, 0);
+  mac_write8(0x522, 0xff);
+  bb_set(0x1e70, 0x0000000f, 2);
+  iqk_set_gnt_wl_high();
+  for (uint8_t path = 0; path < 2; ++path) {
+    rf_write(path, 0x00, RFREG_MASK, 0x30000);
+    rf_write(path, 0x92, 1u << 0, 0);
+    rf_write(path, 0x93, 1u << 6, 0);
+    rf_write(path, 0x92, 1u << 0, 1);
+    delay_ms(2);
+    rf_write(path, 0x92, 1u << 0, 0);
+    rf_write(path, 0x93, 1u << 6, 1);
+    rf_write(path, 0x92, 1u << 0, 1);
+    delay_ms(2);
+    rf_write(path, 0x92, 1u << 0, 0);
+  }
+  btc_write_indirect(0x38, 0xffffffffu, gnt);
+  bb_write(0x180c, save_180c);
+  bb_write(0x410c, save_410c);
+  bb_write(0x1d70, 0x50505050);
+  bb_write(0x1d70, 0x20202020);
+  mac_write8(0x522, save_522);
+  bb_write(0x1e70, save_1e70);
+  _logger->info("Jaguar3(8822e): RX DCK complete (paths=2)");
+}
+
+void Halrf8822e::tssi_calibrate(uint8_t channel) {
+  /* The supplied driver only enters its full codeword/TSSI loop when its
+   * power-track type is TSSI.  H09 is provisioned for thermal tracking, but
+   * the vendor still runs this per-path TSSI DC cancellation during RFK. */
+  const uint16_t tssi[] = {0x1830, 0x4130};
+  const uint16_t enable[] = {0x180c, 0x410c};
+  const uint16_t counter[] = {0x18a4, 0x41a4};
+  const uint16_t offset[] = {0x189c, 0x419c};
+  const uint16_t path_sel[] = {0x1800, 0x4100};
+  const uint16_t rf_page[] = {0x7f, 0x7f};
+  const uint32_t save_1800 = bb_read(0x1800);
+  const uint32_t save_4100 = bb_read(0x4100);
+  const uint32_t save_180c = bb_read(0x180c);
+  const uint32_t save_410c = bb_read(0x410c);
+  const uint32_t save_820 = bb_read(0x820);
+  const uint32_t save_1e2c = bb_read(0x1e2c);
+  const uint32_t save_1d08 = bb_read(0x1d08);
+  const uint32_t save_1ca4 = bb_read(0x1ca4);
+  const uint32_t save_1bcc = bb_read(0x1bcc);
+  const uint32_t save_1e70 = bb_read(0x1e70);
+  const uint32_t save_1c38 = bb_read(0x1c38);
+  const uint32_t save_1c3c = bb_read(0x1c3c);
+  const uint32_t save_1d58 = bb_read(0x1d58);
+  const uint32_t save_1a00 = bb_read(0x1a00);
+  const uint32_t tssi_words[] = {0x700b8041, 0x701f0042, 0x702f0042,
+                                 0x703f0042, 0x704f0042, 0x705b8041,
+                                 0x706f0042, 0x707b8041, 0x708b8041,
+                                 0x709b8041, 0x70ab8041, 0x70bb8041,
+                                 0x70cb8041, 0x70db8041, 0x70eb8041,
+                                 0x70fb8041};
+  for (uint8_t path = 0; path < 2; ++path) {
+    bb_write(0x1c38, 0xf7d5005e);
+    bb_set(0x1d58, 0x00000008, 1);
+    bb_set(0x1d58, 0x00000ff0, 0xff);
+    bb_set(0x1a00, 0x00000003, 2);
+    for (uint32_t word : tssi_words) bb_write(tssi[path], word);
+    bb_set(offset[path], 0x0003ff00, 0);
+    bb_set(0x820, 0x3, path + 1);
+    bb_write(0x1e2c, 0xe4e40000);
+    bb_set(0x1e28, 0xf, 3);
+    bb_set(path_sel[path], 0x000fffff, 0x33312);
+    bb_set(path_sel[path], 0x80000000, 1);
+    bb_set(counter[path], 0xe0000000, 0);
+    delay_us(200);
+    rf_write(path, rf_page[path], 0x100, 1);
+    rf_write(path, 0x65, 0x03000, 3);
+    rf_write(path, 0x67, 0x00003, 3);
+    rf_write(path, 0x67, 0x00030, 2);
+    rf_write(path, 0x6f, 0x001e0, 0);
+    bb_set(0x900, 0x00000004, 1);
+    bb_set(0x900, 0x30000000, 2);
+    bb_set(0x908, 0x00ffffff, 0x21b6b);
+    bb_set(0x90c, 0x00ffffff, 0x800006);
+    bb_set(0x910, 0x00ffffff, 0x13600);
+    bb_set(0x914, 0x1fffffff, 0x6000fa);
+    bb_set(0x938, 0x0000ffff, 0x4b0f);
+    bb_write(0x940, 0x4ee33e41);
+    bb_set(0xa58, 0x003f8000, 0x2c);
+    bb_set(enable[path], 0x08000000, 1);
+    bb_set(enable[path], 0x40000000, 1);
+    bb_set(0x1d08, 1, 1);
+    bb_set(0x1ca4, 1, 1);
+    bb_set(0x1b00, 0x6, path);
+    bb_set(0x1bcc, 0x3f, 0x3f);
+    rf_write(path, 0xde, 0x10000, 1);
+    rf_write(path, 0x56, 0xff, 0);
+    bb_set(0x1e70, 0x4, 1);
+    bb_set(counter[path], 0x10000000, 0);
+    bb_set(counter[path], 0x10000000, 1);
+    const uint32_t sample = bb_get(0x2dbc, 0x3ff);
+    uint32_t dc = (1024u - (((sample - 512u) * 4u) & 0x3ffu) + 5u) & 0x3ffu;
+    bb_set(offset[path], 0x0003ff00, dc);
+    for (int retry = 0; retry < 3; ++retry) {
+      bb_set(counter[path], 0x10000000, 0);
+      bb_set(counter[path], 0x10000000, 1);
+      const uint32_t check = bb_get(0x2dbc, 0x3ff);
+      if (check >= 0x1ff && check <= 0x202) break;
+      if (check < 0x1ff) dc = std::min(0x3ffu, dc + 4);
+      else dc = dc < 4 ? 0 : dc - 4;
+      bb_set(offset[path], 0x0003ff00, dc);
+    }
+    bb_set(0x1e70, 0xf, 2);
+    rf_write(path, 0xde, 0x10000, 0);
+    bb_set(0x1bcc, 0x3f, 0);
+    bb_set(0x1ca4, 1, 0);
+    bb_set(0x1d08, 1, 0);
+    rf_write(path, rf_page[path], 0x100, 0);
+    bb_set(enable[path], 0x08000000, 0);
+    bb_set(enable[path], 0x40000000, 0);
+    bb_set(counter[path], 0x10000000, 0);
+  }
+  /* Vendor _reload_bb_registers_8822e restores the entire TSSI scratch set.
+   * In particular, 0x1800/0x4100 bit31 is the temporary TSSI path-enable; it
+   * must not leak into the normal 0x33312 TRX route. */
+  bb_write(0x1800, save_1800);
+  bb_write(0x4100, save_4100);
+  bb_write(0x180c, save_180c);
+  bb_write(0x410c, save_410c);
+  bb_write(0x820, save_820);
+  bb_write(0x1e2c, save_1e2c);
+  bb_write(0x1d08, save_1d08);
+  bb_write(0x1ca4, save_1ca4);
+  bb_write(0x1bcc, save_1bcc);
+  bb_write(0x1e70, save_1e70);
+  bb_write(0x1c38, save_1c38);
+  bb_write(0x1c3c, save_1c3c);
+  bb_write(0x1d58, save_1d58);
+  bb_write(0x1a00, save_1a00);
+  _logger->info("Jaguar3(8822e): TSSI DCK complete (ch={} paths=2)", channel);
+}
+
+void Halrf8822e::set_tssi_efuse_map(const uint8_t *map, size_t len) {
+  _tssi_efuse_valid = false;
+  if (map == nullptr || len < 0x5a)
+    return;
+
+  bool programmed = false;
+  for (uint8_t i = 0; i < 11; ++i) {
+    const uint8_t a = map[0x10 + i];
+    const uint8_t b = map[0x3a + i];
+    _tssi_efuse[0][i] = static_cast<int8_t>(a);
+    _tssi_efuse[1][i] = static_cast<int8_t>(b);
+    programmed |= a != 0xff || b != 0xff;
+  }
+  for (uint8_t i = 0; i < 14; ++i) {
+    const uint8_t a = map[0x22 + i];
+    const uint8_t b = map[0x4c + i];
+    _tssi_efuse[0][11 + i] = static_cast<int8_t>(a);
+    _tssi_efuse[1][11 + i] = static_cast<int8_t>(b);
+    programmed |= a != 0xff || b != 0xff;
+  }
+  _tssi_efuse_valid = programmed;
+  _logger->info("Jaguar3(8822e): TSSI efuse table {}", programmed ? "loaded" : "empty");
+}
+
+namespace {
+int tssi_channel_group(uint8_t channel) {
+  if (channel <= 2) return 6;
+  if (channel <= 5) return 7;
+  if (channel <= 8) return 8;
+  if (channel <= 11) return 9;
+  if (channel <= 14) return 10;
+  if (channel <= 40) return 11;
+  if (channel <= 48) return 12;
+  if (channel <= 58) return 13;
+  if (channel <= 64) return 14;
+  if (channel <= 104) return 15;
+  if (channel <= 112) return 16;
+  if (channel <= 120) return 17;
+  if (channel <= 128) return 18;
+  if (channel <= 136) return 19;
+  if (channel <= 144) return 20;
+  if (channel <= 153) return 21;
+  if (channel <= 161) return 22;
+  if (channel <= 169) return 23;
+  return 24;
+}
+
+int tssi_cck_group(uint8_t channel) {
+  if (channel <= 2) return 0;
+  if (channel <= 5) return 1;
+  if (channel <= 8) return 2;
+  if (channel <= 11) return 3;
+  if (channel <= 13) return 4;
+  return 5;
+}
+
+uint8_t tssi_index_for_pg(uint32_t address, uint8_t byte) {
+  static constexpr uint8_t kBase[] = {
+      0, 4, 8, 12, 16, 20, 24, 44, 48, 52, 56, 60};
+  if (address < 0xc20 || address > 0xc4c || (address - 0xc20) % 4 != 0)
+    return 0xff;
+  const uint8_t word = static_cast<uint8_t>((address - 0xc20) / 4);
+  if (word >= std::size(kBase) || byte > 3)
+    return 0xff;
+  return static_cast<uint8_t>(kBase[word] + byte);
+}
+} /* namespace */
+
+void Halrf8822e::tssi_program_de(uint8_t channel) {
+  if (!_tssi_efuse_valid)
+    return;
+  const int index = tssi_channel_group(channel);
+  const int cck_index = tssi_cck_group(channel);
+  const int8_t a = _tssi_efuse[0][index];
+  const int8_t b = _tssi_efuse[1][index];
+  const int8_t cck_a = _tssi_efuse[0][cck_index];
+  const int8_t cck_b = _tssi_efuse[1][cck_index];
+  const uint32_t ua = static_cast<uint8_t>(a);
+  const uint32_t ub = static_cast<uint8_t>(b);
+  const uint32_t ucck_a = static_cast<uint8_t>(cck_a);
+  const uint32_t ucck_b = static_cast<uint8_t>(cck_b);
+
+  /* halrf_tssi_set_de_8822e: signed EFUSE DE, clipped to the hardware's
+   * signed 8-bit range, in both OFDM and CCK offset fields. */
+  bb_set(0x18a8, 0xff000000, ua);
+  bb_set(0x1eec, 0x3fc00000, ub);
+  bb_set(0x18e8, 0x01fe0000, ucck_a);
+  bb_set(0x1ef0, 0x0001fe00, ucck_b);
+  _logger->info("Jaguar3(8822e): TSSI DE ch={} OFDM group={} CCK group={} "
+                "A={} B={} CCK_A={} CCK_B={}",
+                channel, index, cck_index, static_cast<int>(a),
+                static_cast<int>(b), static_cast<int>(cck_a),
+                static_cast<int>(cck_b));
+}
+
+void Halrf8822e::tssi_program_codewords(uint8_t channel) {
+  uint32_t pg[84];
+  std::fill(std::begin(pg), std::end(pg), 0);
+  const uint32_t band = channel <= 14 ? 0u : 1u;
+  uint8_t anchor = 0;
+
+  /* The vendor's phydm_get_tx_power_dbm() returns the PHY target index divided
+   * by txgi_pdbm=4 on RTL8822E. Reuse the same generated PHY_REG_PG values
+   * that apply_power_by_rate_8822e already writes, then apply the vendor's
+   * integer slope/codeword formula verbatim. Missing 3SS/4SS rows are kept at
+   * the MCS7 anchor, matching the 2T2R table shipped for this chip. */
+  const uint32_t *table = array_mp_8822e_phy_reg_pg;
+  const uint32_t n = array_mp_8822e_phy_reg_pg_len;
+  auto byte = [](uint32_t value, uint8_t i) {
+    return static_cast<uint8_t>((value >> (i * 8)) & 0xff);
+  };
+  for (uint32_t i = 0; i + 5 < n; i += 6) {
+    if (table[i] != band || table[i + 1] != 0)
+      continue;
+    const uint32_t address = table[i + 3] & 0xffff;
+    if (address == 0xc30)
+      anchor = byte(table[i + 5], 3);
+  }
+  if (anchor == 0)
+    return;
+  std::fill(std::begin(pg), std::end(pg), anchor);
+  for (uint32_t i = 0; i + 5 < n; i += 6) {
+    if (table[i] != band || table[i + 1] != 0)
+      continue;
+    const uint32_t address = table[i + 3] & 0xffff;
+    for (uint8_t j = 0; j < 4; ++j) {
+      const uint8_t index = tssi_index_for_pg(address, j);
+      if (index != 0xff && index < std::size(pg))
+        pg[index] = byte(table[i + 5], j);
+    }
+  }
+
+  const uint32_t big_a_raw = bb_get(0x18a8, 0x00007ffc);
+  if (big_a_raw == 0)
+    return;
+  const uint32_t big_a = (big_a_raw * 100) / 128;
+  const uint32_t small_a = 434295 / big_a;
+  const uint32_t slope = 1000000 / small_a;
+  uint8_t codeword[84] = {};
+  for (size_t i = 0; i < std::size(codeword); ++i) {
+    const uint32_t power_dbm = pg[i] / 4; /* vendor txgi_pdbm = 4 */
+    uint32_t value = power_dbm * slope / 1000 + 64; /* small_b */
+    if (value > 0xff)
+      value = 0xff;
+    codeword[i] = static_cast<uint8_t>(value);
+  }
+  for (uint16_t address = 0x3a54, i = 0; address <= 0x3aa4;
+       address += 4, i += 4) {
+    const uint32_t value = static_cast<uint32_t>(codeword[i]) |
+                           (static_cast<uint32_t>(codeword[i + 1]) << 8) |
+                           (static_cast<uint32_t>(codeword[i + 2]) << 16) |
+                           (static_cast<uint32_t>(codeword[i + 3]) << 24);
+    bb_write(address, value);
+  }
+  _logger->info("Jaguar3(8822e): TSSI codeword table programmed (ch={} band={} "
+                "big_a={} slope={} MCS7={})",
+                channel, band, big_a_raw, slope, codeword[19]);
+}
+
+void Halrf8822e::configure_tssi(uint8_t channel) {
+  tssi_program_de(channel);
+  tssi_program_codewords(channel);
+}
+
 void Halrf8822e::phy_iq_calibrate(ChannelWidth_t bw, uint8_t channel) {
   iqk_init();
   iqk_information(bw);
+
+  if (channel > 14) {
+    rx_spur_k(channel);
+    rx_dck();
+  }
 
   _iqk.iqk_step = 0;
   _iqk.fail_step = 0;
@@ -1082,6 +1503,13 @@ void Halrf8822e::phy_iq_calibrate(ChannelWidth_t bw, uint8_t channel) {
   iqk_restore_mac_bb();
   if (_iqk.fail_step != 0x0)
     _iqk.fail_count++;
+  for (uint8_t path = 0; path < SS_8822E; ++path)
+    _logger->info(
+        "Jaguar3(8822e): IQK path={} lok_fail={} tx_fail={} rx_fail={} "
+        "lok_idac=0x{:05x} iqc_matrix=0x{:08x}",
+        path, _iqk.lok_fail[path], _iqk.iqk_fail_report[0][path][0],
+        _iqk.iqk_fail_report[0][path][1], _iqk.lok_idac[0][path],
+        _iqk.iqc_matrix[0][path]);
   /* fail_step bits: 0=LOK1 1=TXK 2=RX-gain-search 3=RXK (per path, OR'd). */
   char buf[8];
   std::snprintf(buf, sizeof(buf), "0x%02x", _iqk.fail_step);
@@ -1094,6 +1522,8 @@ void Halrf8822e::phy_iq_calibrate(ChannelWidth_t bw, uint8_t channel) {
     _logger->info("Jaguar3(8822e): TXGAPK SKIPPED (debug)");
   else
     do_txgapk(channel);
+  if (channel > 14)
+    tssi_calibrate(channel);
 }
 
 /* 8822e thermal delta-swing tables (halhwimg8822e_rf.c _txpowertrack), 5 GHz

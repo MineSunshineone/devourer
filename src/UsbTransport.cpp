@@ -38,6 +38,7 @@ inline void atomic_max(std::atomic<long long> &m, long long v) {
 struct AsyncRxShared {
   const std::function<void(const uint8_t *, int)> *cb;
   const std::function<bool()> *stop;
+  Logger_t logger;
   /* Atomic: in co-running (TX + self-capture RX) mode both the RX loop's own
    * event pump and the TX event loop may run this callback, so `active` is
    * written from the pump thread while the loop below reads it. */
@@ -146,6 +147,10 @@ inline void rx_consume(AsyncRxShared *s, const uint8_t *buf, int len) {
 
 extern "C" void LIBUSB_CALL devourer_rx_cb(libusb_transfer *t) {
   auto *s = static_cast<AsyncRxShared *>(t->user_data);
+  if (t->status != LIBUSB_TRANSFER_COMPLETED &&
+      t->status != LIBUSB_TRANSFER_TIMED_OUT && !(*s->stop)())
+    s->logger->error("RX: bulk-IN transfer error status={} actual_length={}",
+                     static_cast<int>(t->status), t->actual_length);
   if (t->status == LIBUSB_TRANSFER_NO_DEVICE)
     s->dead.store(true, std::memory_order_relaxed);
   /* This URB just completed — it has left the wire until resubmitted. */
@@ -158,7 +163,10 @@ extern "C" void LIBUSB_CALL devourer_rx_cb(libusb_transfer *t) {
   }
   const bool resubmit = !(*s->stop)() &&
                         (t->status == LIBUSB_TRANSFER_COMPLETED ||
-                         t->status == LIBUSB_TRANSFER_TIMED_OUT);
+                         t->status == LIBUSB_TRANSFER_TIMED_OUT ||
+                         /* xHCI can report a transient -EPROTO as ERROR;
+                          * retiring every affected URB eventually empties RX. */
+                         t->status == LIBUSB_TRANSFER_ERROR);
   const int rlen = t->status == LIBUSB_TRANSFER_COMPLETED ? t->actual_length : 0;
 
   if (s->reorder) {
@@ -739,6 +747,7 @@ void UsbTransport::rx_loop(
   const bool reorder = _rx_mode == RxMode::ReorderPool;
   const bool spsc = _rx_mode == RxMode::SpscFat;
   AsyncRxShared sh{&on_data, &should_stop};
+  sh.logger = _logger;
   sh.telemetry = _ring_ms > 0;
   sh.reorder = reorder;
   sh.spsc = spsc;
@@ -1179,6 +1188,7 @@ void UsbTransport::transfer_callback(struct libusb_transfer *transfer) {
   libusb_free_transfer(transfer);
   /* Last, so a quiesce_tx loop that sees _tx_inflight == 0 knows every buffer
    * and transfer is already freed and nothing more will touch this object. */
+  self->_tx_async_completed.fetch_add(1, std::memory_order_relaxed);
   self->_tx_inflight.fetch_sub(1, std::memory_order_release);
 }
 
@@ -1245,15 +1255,18 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
   {
     struct timeval zero {0, 0};
     libusb_handle_events_timeout_completed(_ctx, &zero, nullptr);
-    /* Soft cap: keep at most kMaxInflight transfers pending. Beyond it, wait
-     * for completions rather than pile onto the kernel queue. */
+    /* Reap once at the soft cap, then refuse this submission if still full.
+     * A stalled device must not hold the caller in an unbounded event loop. */
     constexpr int kMaxInflight = 256;
-    while (_tx_inflight.load(std::memory_order_relaxed) >= kMaxInflight) {
+    if (_tx_inflight.load(std::memory_order_relaxed) >= kMaxInflight) {
       struct timeval tv {0, 2000};
-      if (libusb_handle_events_timeout_completed(_ctx, &tv, nullptr) != 0)
-        break; /* don't spin forever on a libusb error */
+      if (libusb_handle_events_timeout_completed(_ctx, &tv, nullptr) != 0 ||
+          _tx_inflight.load(std::memory_order_relaxed) >= kMaxInflight)
+        return false;
     }
   }
+  if (_tx_shutdown.load(std::memory_order_acquire))
+    return false;
 
   libusb_transfer *transfer = libusb_alloc_transfer(0);
   if (!transfer) {
@@ -1375,6 +1388,7 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
 
 int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
                           int timeout_ms) {
+  std::lock_guard<std::mutex> tx_lock(_tx_sync_mu);
   flush_writes();
   /* No libusb_clear_halt here. rtw88_8814au's usbmon shows the first bulk
    * OUT is preceded by 0 CLEAR_FEATUREs; later CLEAR_FEATUREs happen during
@@ -1407,7 +1421,7 @@ int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
                    (int)length);
     return actual;
   }
-  _logger->info("bulk_send EP {} OK {} bytes", (int)ep, actual);
+  _logger->trace("bulk_send EP {} OK {} bytes", (int)ep, actual);
   return actual;
 }
 
@@ -1423,6 +1437,9 @@ TxStats UsbTransport::tx_stats() const {
   TxStats s;
   s.submitted = _tx_submitted.load(std::memory_order_relaxed);
   s.failed = _tx_failed.load(std::memory_order_relaxed);
+  s.async_completed = _tx_async_completed.load(std::memory_order_relaxed);
+  s.async_inflight = static_cast<uint32_t>(
+      std::max(0, _tx_inflight.load(std::memory_order_relaxed)));
   s.last_error_rc = _tx_last_rc.load(std::memory_order_relaxed);
   s.last_was_timeout = _tx_last_timeout.load(std::memory_order_relaxed);
   return s;
