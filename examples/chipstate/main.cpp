@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #if __has_include(<libusb.h>)
@@ -39,7 +40,6 @@
 
 #include "DeviceSession.h"
 #include "IRtlRadio.h"
-#include "RtlAdapter.h"
 #include "UsbOpen.h"
 #include "WiFiDriver.h"
 #include "logger.h"
@@ -165,25 +165,29 @@ bool parse_poke(const char *s, RegOp &op) {
 /* Raw register client over the transport layer — deliberately below
  * CreateRadio so it works on any die, configured or not. */
 int run_reg_ops(libusb_device_handle *handle, Logger_t logger,
-                libusb_context *ctx,
-                std::shared_ptr<devourer::UsbDeviceLock> lock,
                 const std::vector<RegOp> &ops) {
-  /* A failed vendor-control read throws (UsbTransport::ctrl_read) — on a
-   * powered-down or wedged chip that is a real answer about the chip, so
-   * report which op died and exit nonzero instead of terminating. The
-   * adapter is built inside the try too: its constructor already reads a
-   * register, and after --init that read is the first thing that can fail. */
+  // Constructing a bulk transport clears RX halt; register access needs EP0 only.
+  const auto read = [&](uint16_t addr, int width) {
+    uint8_t data[4]{};
+    const int rc = libusb_control_transfer(handle, 0xC0, 5, addr, 0, data,
+                                           static_cast<uint16_t>(width), 500);
+    if (rc != width)
+      throw std::runtime_error("read register " + std::to_string(addr) +
+                               " returned " + std::to_string(rc));
+    uint32_t value = 0;
+    for (int i = 0; i < width; ++i) value |= uint32_t(data[i]) << (8 * i);
+    return value;
+  };
+  const auto write = [&](uint16_t addr, int width, uint32_t value) {
+    uint8_t data[4]{};
+    for (int i = 0; i < width; ++i) data[i] = static_cast<uint8_t>(value >> (8 * i));
+    return libusb_control_transfer(handle, 0x40, 5, addr, 0, data,
+                                    static_cast<uint16_t>(width), 500) == width;
+  };
   try {
-    RtlAdapter adapter(handle, logger, ctx, lock);
     for (const RegOp &op : ops) {
       if (op.write) {
-        bool ok;
-        if (op.width == 4)
-          ok = adapter.rtw_write32(op.addr, op.val);
-        else if (op.width == 2)
-          ok = adapter.rtw_write16(op.addr, static_cast<uint16_t>(op.val));
-        else
-          ok = adapter.rtw_write8(op.addr, static_cast<uint8_t>(op.val));
+        const bool ok = write(op.addr, op.width, op.val);
         if (!ok) {
           /* A write the chip did not take must not print as a poke, or a
            * following peek reads as a verdict about bits that were never
@@ -201,7 +205,7 @@ int run_reg_ops(libusb_device_handle *handle, Logger_t logger,
             if (i < op.addr || i > op.end)
               std::printf("         ");
             else
-              std::printf(" %08x", adapter.rtw_read32(static_cast<uint16_t>(i)));
+              std::printf(" %08x", read(static_cast<uint16_t>(i), 4));
           }
           std::printf("\n");
         }
@@ -212,7 +216,7 @@ int run_reg_ops(libusb_device_handle *handle, Logger_t logger,
             if (i < op.addr || i > op.end)
               std::printf("   ");
             else
-              std::printf(" %02x", adapter.rtw_read8(static_cast<uint16_t>(i)));
+              std::printf(" %02x", read(static_cast<uint16_t>(i), 1));
           }
           std::printf("\n");
         }
@@ -311,16 +315,16 @@ int main(int argc, char **argv) {
    * need the interface, so peeks/pokes work while another process (a live
    * armed rxdemo) owns it — the concurrent-intervention mode. */
   if (a.no_claim) {
+    std::unique_ptr<libusb_device_handle, decltype(&libusb_close)> unclaimed(
+        handle, libusb_close);
     if (a.ops.empty() || a.init) {
       logger->error(a.init ? "--init needs the claimed-device path; drop "
                              "--no-claim"
                            : "--no-claim is peek/poke-only (the canary dump "
                              "needs the claimed device)");
-      session.adopt_handle(handle);
       return 2;
     }
-    session.adopt_handle(handle);
-    return run_reg_ops(handle, logger, ctx, nullptr, a.ops);
+    return run_reg_ops(handle, logger, a.ops);
   }
 
   /* do_reset=false is the whole point: a USB reset re-runs the chip's own boot
@@ -341,7 +345,7 @@ int main(int argc, char **argv) {
    * construction at all — the chip is not even identified, let alone
    * configured, so this works mid-experiment on any die. */
   if (!a.ops.empty() && !a.init)
-    return run_reg_ops(handle, logger, ctx, lock, a.ops);
+    return run_reg_ops(handle, logger, a.ops);
 
   devourer::DeviceConfig cfg;
   /* Leave the chip exactly as found. Without this the device destructor runs
@@ -370,7 +374,7 @@ int main(int argc, char **argv) {
      * register write. Same handle, interface still claimed. */
     if (!a.ops.empty()) {
       session.adopt_device(nullptr);
-      return run_reg_ops(handle, logger, ctx, lock, a.ops);
+      return run_reg_ops(handle, logger, a.ops);
     }
   } else {
     logger->info("chipstate: read-only attach (no USB reset, no bring-up) — "

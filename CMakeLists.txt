@@ -1754,6 +1754,15 @@ target_link_libraries(ChanMigReplay PRIVATE devourer)
 # synthetic psi-variance spikes / SNR notches must localize to the right tone
 # group. The RF-side capture path is validated out-of-band (tests/rx_tone_localize.sh).
 find_package(Python3 COMPONENTS Interpreter)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING AND Python3_Interpreter_FOUND)
+    add_library(ChipstateNoClaimSpy SHARED tests/chipstate_no_claim_spy.cpp)
+    target_compile_features(ChipstateNoClaimSpy PRIVATE cxx_std_20)
+    target_link_libraries(ChipstateNoClaimSpy PRIVATE PkgConfig::libusb)
+    add_test(NAME chipstate_no_claim
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/chipstate_no_claim_test.py
+                $<TARGET_FILE:chipstate> $<TARGET_FILE:ChipstateNoClaimSpy>)
+endif()
+
 if(Python3_Interpreter_FOUND)
     add_test(
         NAME rx_tone_localize_math
@@ -1831,3 +1840,7 @@ foreach(_dvr_t IN LISTS _dvr_targets)
         add_dependencies(selftests ${_dvr_t})
     endif()
 endforeach()
+
+if(TARGET ChipstateNoClaimSpy)
+    add_dependencies(selftests chipstate ChipstateNoClaimSpy)
+endif()
