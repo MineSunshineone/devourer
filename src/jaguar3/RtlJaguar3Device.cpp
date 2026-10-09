@@ -2334,8 +2334,8 @@ void RtlJaguar3Device::DumpChipState() {
  * endpoint selects the hardware TX queue, so it must agree with the
  * descriptor's QSEL. The QSEL -> endpoint map, its endpoint-count rule and the
  * QSEL order are src/jaguar3/TxQueueMap.h (pinned by
- * tests/txqueue_selftest.cpp). Every 802.11 data frame is queued as TID 0
- * (BE) whatever its own QoS TID - only SetAmpduMode picks another. The
+ * tests/txqueue_selftest.cpp). SetAmpduMode preserves a QoS frame's TID,
+ * and only its configured TID borrows the aggregation context. The
  * page-count measurement behind the queue change: docs/jaguar3-tx-ring.md. */
 using jaguar3::bulkout_id_for_qsel;
 
@@ -2360,16 +2360,16 @@ uint8_t RtlJaguar3Device::tx_ep_for_descriptor(const uint8_t *desc) const {
 
 uint8_t RtlJaguar3Device::peek_tx_qsel(const uint8_t *packet, size_t length,
                                        const devourer::AmpduMode &am) const {
-  /* The same jaguar3::tx_qsel() build_tx_block stamps, from the same
+  /* The same jaguar3::tx_frame_queue() build_tx_block stamps, from the same
    * frame-type predicate and the same A-MPDU snapshot `am`. */
-  bool is_data = false;
   if (length >= sizeof(struct ieee80211_radiotap_header)) {
     const uint16_t rl = get_unaligned_le16(packet + 2);
     if (rl != 0 && static_cast<size_t>(rl) < length)
-      is_data = jaguar3::dot11_is_data(packet[rl]);
+      return jaguar3::tx_frame_queue(
+          packet + rl, length - rl, _device.bulk_out_ep_count(), am.enabled,
+          am.tid, _cfg.debug.tx_qsel ? int(*_cfg.debug.tx_qsel) : -1).qsel;
   }
-  return jaguar3::tx_qsel(is_data, _device.bulk_out_ep_count(), am.enabled,
-                          am.tid,
+  return jaguar3::tx_qsel(false, _device.bulk_out_ep_count(), am.enabled, am.tid,
                           _cfg.debug.tx_qsel ? int(*_cfg.debug.tx_qsel) : -1);
 }
 
@@ -2802,16 +2802,14 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
    *
    * The FINAL QSEL - this, SetAmpduMode's TID (data frames only) and the
    * DEVOURER_TX_QSEL debug override, with the endpoint-count rule - is one
-   * pure function, jaguar3::tx_qsel() (TxQueueMap.h), which peek_tx_qsel
+   * pure function, jaguar3::tx_frame_queue() (TxQueueMap.h), which peek_tx_qsel
    * calls with the same inputs, so the two cannot drift. Written here,
    * before the unconditional checksum below. */
-  const bool is_data = frame_len >= 1 && jaguar3::dot11_is_data(dot11[0]);
-  const bool ampdu_data = am.enabled && is_data;
-  SET_TX_DESC_QSEL_8822C(
-      out, jaguar3::tx_qsel(is_data, _device.bulk_out_ep_count(), am.enabled,
-                            am.tid,
-                            _cfg.debug.tx_qsel ? int(*_cfg.debug.tx_qsel)
-                                               : -1));
+  const auto queue = jaguar3::tx_frame_queue(
+      dot11, frame_len, _device.bulk_out_ep_count(), am.enabled, am.tid,
+      _cfg.debug.tx_qsel ? int(*_cfg.debug.tx_qsel) : -1);
+  const bool ampdu_data = queue.ampdu;
+  SET_TX_DESC_QSEL_8822C(out, queue.qsel);
   if (_cfg.tx.report) {
     /* DEVOURER_TX_REPORT: SPE_RPT asks the fw for a CCX TX report; the
      * report echoes SW_DEFINE's low byte, so stamp a rotating tag for
