@@ -1659,6 +1659,11 @@ target_link_libraries(TxQueueSelftest PRIVATE devourer)
 target_include_directories(TxQueueSelftest PRIVATE src)
 add_test(NAME txqueue_map COMMAND TxQueueSelftest)
 
+add_executable(RxTransferLengthSelftest tests/rx_transfer_length_selftest.cpp)
+target_link_libraries(RxTransferLengthSelftest PRIVATE devourer)
+target_include_directories(RxTransferLengthSelftest PRIVATE src)
+add_test(NAME rx_transfer_length COMMAND RxTransferLengthSelftest)
+
 # Headless guard for the beamforming-report decoder (src/BfReportDecode.h) — the
 # LSB-first Givens-angle unpacking + per-tone variance behind sense. It
 # decodes a real captured VHT MU report and checks the angles against an offline

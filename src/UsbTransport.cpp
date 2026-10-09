@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "BulkOutTimeout.h"
+#include "RxTransferLength.h"
 #include "Event.h"
 #include "UsbDeviceLock.h"
 #include "UsbOpen.h"
@@ -167,7 +168,7 @@ extern "C" void LIBUSB_CALL devourer_rx_cb(libusb_transfer *t) {
                          /* xHCI can report a transient -EPROTO as ERROR;
                           * retiring every affected URB eventually empties RX. */
                          t->status == LIBUSB_TRANSFER_ERROR);
-  const int rlen = t->status == LIBUSB_TRANSFER_COMPLETED ? t->actual_length : 0;
+  const int rlen = rx_transfer_length(t->status, t->actual_length, t->length);
 
   if (s->reorder) {
     uint8_t *received = t->buffer;
