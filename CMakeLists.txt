@@ -1360,6 +1360,10 @@ if(DEVOURER_KESTREL)
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME kestrel_ampdu_desc COMMAND KestrelAmpduDescSelftest)
 
+    add_executable(KestrelPeerSelftest tests/kestrel_peer_selftest.cpp)
+    target_link_libraries(KestrelPeerSelftest PRIVATE devourer)
+    add_test(NAME kestrel_peer COMMAND KestrelPeerSelftest)
+
     # Golden-bytes guard for the trigger-UL + TWT H2C content encoders
     # (src/kestrel/SchedEncode.h): each config's emitted LE dwords vs the
     # hand-computed vendor SET_WORD layout (F2P v0/v1, TWT, UL_FIXINFO).
@@ -1670,6 +1674,12 @@ add_executable(RxTransferLengthSelftest tests/rx_transfer_length_selftest.cpp)
 target_link_libraries(RxTransferLengthSelftest PRIVATE devourer)
 target_include_directories(RxTransferLengthSelftest PRIVATE src)
 add_test(NAME rx_transfer_length COMMAND RxTransferLengthSelftest)
+
+if(DEVOURER_JAGUAR3_8822E)
+    add_executable(Jaguar3RfkSelftest tests/jaguar3_rfk_selftest.cpp)
+    target_link_libraries(Jaguar3RfkSelftest PRIVATE devourer)
+    add_test(NAME jaguar3_rfk COMMAND Jaguar3RfkSelftest)
+endif()
 
 # Headless guard for the beamforming-report decoder (src/BfReportDecode.h) — the
 # LSB-first Givens-angle unpacking + per-tone variance behind sense. It

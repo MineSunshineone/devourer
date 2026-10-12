@@ -979,12 +979,20 @@ void RadioManagementJaguar3::apply_power_by_rate_8822e(uint8_t channel,
    * match the kernel's MCS7 level) anchors MCS7 at diff 0 and the by-rate spread
    * matches the kernel (MCS0 -> ref_base + 24 = the kernel's +6 dB). */
   const uint32_t band = channel <= 14 ? 0u : 1u;
+#if defined(DEVOURER_HAVE_JAGUAR3_8822C) && defined(DEVOURER_HAVE_JAGUAR3_8822E)
   const uint32_t *pg = _variant == ChipVariant::C8822C
                            ? array_mp_8822c_phy_reg_pg
                            : array_mp_8822e_phy_reg_pg;
   const uint32_t n = _variant == ChipVariant::C8822C
                          ? array_mp_8822c_phy_reg_pg_len
                          : array_mp_8822e_phy_reg_pg_len;
+#elif defined(DEVOURER_HAVE_JAGUAR3_8822C)
+  const uint32_t *pg = array_mp_8822c_phy_reg_pg;
+  const uint32_t n = array_mp_8822c_phy_reg_pg_len;
+#else
+  const uint32_t *pg = array_mp_8822e_phy_reg_pg;
+  const uint32_t n = array_mp_8822e_phy_reg_pg_len;
+#endif
   auto get_val = [](uint32_t v, int i) -> uint8_t {
     return static_cast<uint8_t>((v >> (i * 8)) & 0xff);
   };

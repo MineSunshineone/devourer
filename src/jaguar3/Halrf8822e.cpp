@@ -1067,8 +1067,9 @@ void Halrf8822e::rx_spur_k(uint8_t channel) {
                      channel == 159 || channel == 161 || channel == 167 ||
                      channel == 169 || channel == 171;
   if (!sweep) {
-    bb_set(0x1814, 1u << 30, 1);
-    bb_set(0x4114, 1u << 30, 1);
+    const uint32_t pll = channel == 54 || channel == 58 ? 0 : 1;
+    bb_set(0x1814, 1u << 30, pll);
+    bb_set(0x4114, 1u << 30, pll);
     bb_set(0x2c, 0x0001e000, 8);
     _logger->info("Jaguar3(8822e): RX Spur K fixed (ch={} idx=8)", channel);
     return;
@@ -1103,6 +1104,13 @@ void Halrf8822e::rx_spur_k(uint8_t channel) {
   const uint32_t gnt = btc_read_indirect(0x38);
   iqk_set_gnt_wl_high();
   rf_write(1, 0x00, RFREG_MASK, 0x31daf);
+  bb_set(0x1b00, 0x00000006, 1);
+  bb_set(0x1b0c, 0x00000c00, 3);
+  bb_write(0x1b14, 0);
+  bb_write(0x1b18, 1);
+  bb_write(0x1b1c, 0x82183d21);
+  bb_set(0x1b20, 0x20000000, 0);
+  bb_write(0x1b28, 0);
 
   auto sample = [&](uint8_t idx, bool pll) {
     bb_set(0x1814, 1u << 30, pll ? 1 : 0);
@@ -1136,6 +1144,21 @@ void Halrf8822e::rx_spur_k(uint8_t channel) {
     }
   }
   if (any) {
+    if (min_value < 0x7fff &&
+        (channel == 159 || channel == 161 || channel == 167 ||
+         channel == 169 || channel == 171)) {
+      bb_set(0x1944, 0x0001f000, 0);
+      bb_set(0x4044, 0x0001f000, 0);
+      bb_set(0x1940, 0x80000000, 0);
+      bb_set(0x4040, 0x80000000, 0);
+      bb_set(0x818, 0x00000800, 0);
+      bb_set(0x1d3c, 0x78000000, 0);
+      bb_set(0x810, 0x0000000f, 0);
+      bb_set(0x810, 0x000f0000, 0);
+      bb_set(0x88c, 0x00030000, 2);
+      bb_set(0x1944, 0x00000300, 3);
+      bb_set(0x4044, 0x00000300, 3);
+    }
     min_idx = min < 12 ? static_cast<uint8_t>(start + min)
                        : static_cast<uint8_t>(start + min - 12);
     bb_set(0x1814, 1u << 30, min >= 12);
@@ -1148,6 +1171,8 @@ void Halrf8822e::rx_spur_k(uint8_t channel) {
 
   bb_write(0x1c38, 0);
   bb_write(0x1c38, save_1c38);
+  bb_set(0x1b00, 0x00000006, 1);
+  bb_write(0x1b08, 0);
   bb_set(0x4164, 0x80000000, 0);
   bb_set(0x410c, 0x08000000, 0);
   bb_set(0x416c, 0x00000080, 0);
@@ -1155,8 +1180,11 @@ void Halrf8822e::rx_spur_k(uint8_t channel) {
   bb_set(0x1a00, 0x00000003, 0);
   bb_set(0x1b20, 0x20000000, 1);
   bb_write(0x1b1c, save_1b1c);
+  for (const uint16_t reg : {0x1d0c, 0x0})
+    for (const uint32_t value : {1u, 0u, 1u})
+      bb_set(reg, 1u << 16, value);
   bb_set(0x824, 0x000f0000, save_824);
-  bb_set(0x1d58, 0x00000ff8, save_1d58);
+  bb_write(0x1d58, save_1d58);
   rf_write(1, 0x00, RFREG_MASK, save_rf0b);
   _logger->info("Jaguar3(8822e): RX Spur K sweep (ch={} idx={} min=0x{:x})",
                 channel, min_idx, min_value);
@@ -1195,116 +1223,6 @@ void Halrf8822e::rx_dck() {
   _logger->info("Jaguar3(8822e): RX DCK complete (paths=2)");
 }
 
-void Halrf8822e::tssi_calibrate(uint8_t channel) {
-  /* The supplied driver only enters its full codeword/TSSI loop when its
-   * power-track type is TSSI.  H09 is provisioned for thermal tracking, but
-   * the vendor still runs this per-path TSSI DC cancellation during RFK. */
-  const uint16_t tssi[] = {0x1830, 0x4130};
-  const uint16_t enable[] = {0x180c, 0x410c};
-  const uint16_t counter[] = {0x18a4, 0x41a4};
-  const uint16_t offset[] = {0x189c, 0x419c};
-  const uint16_t path_sel[] = {0x1800, 0x4100};
-  const uint16_t rf_page[] = {0x7f, 0x7f};
-  const uint32_t save_1800 = bb_read(0x1800);
-  const uint32_t save_4100 = bb_read(0x4100);
-  const uint32_t save_180c = bb_read(0x180c);
-  const uint32_t save_410c = bb_read(0x410c);
-  const uint32_t save_820 = bb_read(0x820);
-  const uint32_t save_1e2c = bb_read(0x1e2c);
-  const uint32_t save_1d08 = bb_read(0x1d08);
-  const uint32_t save_1ca4 = bb_read(0x1ca4);
-  const uint32_t save_1bcc = bb_read(0x1bcc);
-  const uint32_t save_1e70 = bb_read(0x1e70);
-  const uint32_t save_1c38 = bb_read(0x1c38);
-  const uint32_t save_1c3c = bb_read(0x1c3c);
-  const uint32_t save_1d58 = bb_read(0x1d58);
-  const uint32_t save_1a00 = bb_read(0x1a00);
-  const uint32_t tssi_words[] = {0x700b8041, 0x701f0042, 0x702f0042,
-                                 0x703f0042, 0x704f0042, 0x705b8041,
-                                 0x706f0042, 0x707b8041, 0x708b8041,
-                                 0x709b8041, 0x70ab8041, 0x70bb8041,
-                                 0x70cb8041, 0x70db8041, 0x70eb8041,
-                                 0x70fb8041};
-  for (uint8_t path = 0; path < 2; ++path) {
-    bb_write(0x1c38, 0xf7d5005e);
-    bb_set(0x1d58, 0x00000008, 1);
-    bb_set(0x1d58, 0x00000ff0, 0xff);
-    bb_set(0x1a00, 0x00000003, 2);
-    for (uint32_t word : tssi_words) bb_write(tssi[path], word);
-    bb_set(offset[path], 0x0003ff00, 0);
-    bb_set(0x820, 0x3, path + 1);
-    bb_write(0x1e2c, 0xe4e40000);
-    bb_set(0x1e28, 0xf, 3);
-    bb_set(path_sel[path], 0x000fffff, 0x33312);
-    bb_set(path_sel[path], 0x80000000, 1);
-    bb_set(counter[path], 0xe0000000, 0);
-    delay_us(200);
-    rf_write(path, rf_page[path], 0x100, 1);
-    rf_write(path, 0x65, 0x03000, 3);
-    rf_write(path, 0x67, 0x00003, 3);
-    rf_write(path, 0x67, 0x00030, 2);
-    rf_write(path, 0x6f, 0x001e0, 0);
-    bb_set(0x900, 0x00000004, 1);
-    bb_set(0x900, 0x30000000, 2);
-    bb_set(0x908, 0x00ffffff, 0x21b6b);
-    bb_set(0x90c, 0x00ffffff, 0x800006);
-    bb_set(0x910, 0x00ffffff, 0x13600);
-    bb_set(0x914, 0x1fffffff, 0x6000fa);
-    bb_set(0x938, 0x0000ffff, 0x4b0f);
-    bb_write(0x940, 0x4ee33e41);
-    bb_set(0xa58, 0x003f8000, 0x2c);
-    bb_set(enable[path], 0x08000000, 1);
-    bb_set(enable[path], 0x40000000, 1);
-    bb_set(0x1d08, 1, 1);
-    bb_set(0x1ca4, 1, 1);
-    bb_set(0x1b00, 0x6, path);
-    bb_set(0x1bcc, 0x3f, 0x3f);
-    rf_write(path, 0xde, 0x10000, 1);
-    rf_write(path, 0x56, 0xff, 0);
-    bb_set(0x1e70, 0x4, 1);
-    bb_set(counter[path], 0x10000000, 0);
-    bb_set(counter[path], 0x10000000, 1);
-    const uint32_t sample = bb_get(0x2dbc, 0x3ff);
-    uint32_t dc = (1024u - (((sample - 512u) * 4u) & 0x3ffu) + 5u) & 0x3ffu;
-    bb_set(offset[path], 0x0003ff00, dc);
-    for (int retry = 0; retry < 3; ++retry) {
-      bb_set(counter[path], 0x10000000, 0);
-      bb_set(counter[path], 0x10000000, 1);
-      const uint32_t check = bb_get(0x2dbc, 0x3ff);
-      if (check >= 0x1ff && check <= 0x202) break;
-      if (check < 0x1ff) dc = std::min(0x3ffu, dc + 4);
-      else dc = dc < 4 ? 0 : dc - 4;
-      bb_set(offset[path], 0x0003ff00, dc);
-    }
-    bb_set(0x1e70, 0xf, 2);
-    rf_write(path, 0xde, 0x10000, 0);
-    bb_set(0x1bcc, 0x3f, 0);
-    bb_set(0x1ca4, 1, 0);
-    bb_set(0x1d08, 1, 0);
-    rf_write(path, rf_page[path], 0x100, 0);
-    bb_set(enable[path], 0x08000000, 0);
-    bb_set(enable[path], 0x40000000, 0);
-    bb_set(counter[path], 0x10000000, 0);
-  }
-  /* Vendor _reload_bb_registers_8822e restores the entire TSSI scratch set.
-   * In particular, 0x1800/0x4100 bit31 is the temporary TSSI path-enable; it
-   * must not leak into the normal 0x33312 TRX route. */
-  bb_write(0x1800, save_1800);
-  bb_write(0x4100, save_4100);
-  bb_write(0x180c, save_180c);
-  bb_write(0x410c, save_410c);
-  bb_write(0x820, save_820);
-  bb_write(0x1e2c, save_1e2c);
-  bb_write(0x1d08, save_1d08);
-  bb_write(0x1ca4, save_1ca4);
-  bb_write(0x1bcc, save_1bcc);
-  bb_write(0x1e70, save_1e70);
-  bb_write(0x1c38, save_1c38);
-  bb_write(0x1c3c, save_1c3c);
-  bb_write(0x1d58, save_1d58);
-  bb_write(0x1a00, save_1a00);
-  _logger->info("Jaguar3(8822e): TSSI DCK complete (ch={} paths=2)", channel);
-}
 
 void Halrf8822e::set_tssi_efuse_map(const uint8_t *map, size_t len) {
   _tssi_efuse_valid = false;
@@ -1522,8 +1440,6 @@ void Halrf8822e::phy_iq_calibrate(ChannelWidth_t bw, uint8_t channel) {
     _logger->info("Jaguar3(8822e): TXGAPK SKIPPED (debug)");
   else
     do_txgapk(channel);
-  if (channel > 14)
-    tssi_calibrate(channel);
 }
 
 /* 8822e thermal delta-swing tables (halhwimg8822e_rf.c _txpowertrack), 5 GHz

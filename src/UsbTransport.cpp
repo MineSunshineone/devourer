@@ -1414,7 +1414,7 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
 
 int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
                           int timeout_ms) {
-  std::lock_guard<std::mutex> tx_lock(_tx_sync_mu);
+  std::lock_guard<std::mutex> tx_lock(_tx_sync_mu[ep & 0x0f]);
   if (_tx_needs_reinit.load(std::memory_order_relaxed))
     return LIBUSB_ERROR_IO;
   flush_writes();

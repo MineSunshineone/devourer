@@ -241,16 +241,17 @@ inline std::vector<uint8_t> build_mgnt_txdesc(const uint8_t *frame,
 constexpr uint8_t MAC_AX_DATA_CH0 = 0; /* AC0 (best-effort) DMA channel */
 
 inline uint8_t data_tid(const uint8_t *frame, uint32_t frame_len) {
-  if (frame_len < 26 || (frame[0] & 0x8c) != 0x88) return 0;
+  if (frame_len < 26 || (frame[0] & 0x8c) != 0x88) return 0xff;
   const uint32_t offset = (frame[1] & 3) == 3 ? 30 : 24;
-  if (frame_len < offset + 2) return 0;
+  if (frame_len < offset + 2) return 0xff;
   const uint8_t tid = frame[offset] & 0xf;
-  return tid < 8 ? tid : 0;
+  return tid < 8 ? tid : 0xff;
 }
 
 inline uint8_t data_qsel(const uint8_t *frame, uint32_t frame_len) {
   constexpr uint8_t queues[8]{0, 1, 1, 0, 2, 2, 3, 3};
-  return queues[data_tid(frame, frame_len)];
+  const uint8_t tid = data_tid(frame, frame_len);
+  return queues[tid < 8 ? tid : 0];
 }
 
 inline uint8_t data_macid(const uint8_t *frame, uint32_t frame_len,
@@ -286,7 +287,7 @@ inline void build_data_txdesc_into(std::vector<uint8_t> &buf,
   txd_put_le32(wd + 8,
                (static_cast<uint32_t>(frame_len & 0x3fff) << txd::TXPKTSIZE_SH) |
                    (static_cast<uint32_t>(qsel) << txd::QSEL_SH) |
-                   (indicators[tid] ? txd::TID_IND : 0) |
+                   (tid < 8 && indicators[tid] ? txd::TID_IND : 0) |
                    (static_cast<uint32_t>(macid & 0x7f) << txd::MACID_SH));
   /* Vendor trx_desc_8852b.c: AGG_EN in body dword3; max count is encoded
    * as N-1 in info dword1, density in info dword2. */

@@ -64,5 +64,15 @@ int main() {
   if (kestrel::data_qsel(qos.data(), 25) != 0) return 1;
   qos[0] = 0x08;
   if (kestrel::data_qsel(qos.data(), qos.size()) != 0) return 1;
+  if (kestrel::data_tid(qos.data(), qos.size()) != 0xff) return 1;
+  std::array<uint8_t, 32> four_address{};
+  four_address[0] = 0x88;
+  four_address[1] = 3;
+  four_address[24] = 0; // Address 4 is not the QoS TID.
+  four_address[30] = 6;
+  if (kestrel::data_tid(four_address.data(), four_address.size()) != 6 ||
+      kestrel::data_tid(four_address.data(), 31) != 0xff) return 1;
+  four_address[30] = 15;
+  if (kestrel::data_tid(four_address.data(), four_address.size()) != 0xff) return 1;
   return 0;
 }

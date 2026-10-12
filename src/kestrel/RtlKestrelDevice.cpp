@@ -785,12 +785,21 @@ void RtlKestrelDevice::ClearTxMode() {
 }
 
 bool RtlKestrelDevice::SetAmpduMode(const devourer::AmpduMode &mode) {
+  std::lock_guard lock(_tx_packet_mutex);
   if (mode.enabled && (mode.tid > 7 || mode.max_num == 0 ||
                        mode.density > 7 ||
                        (!mode.no_ack && (!_cfg.rx.ack_responder ||
                                          !_cfg.rx.ack_peer))))
     return false;
-  std::lock_guard lock(_tx_packet_mutex);
+  uint32_t limit = _device.rtw_read32(kestrel::reg::R_AX_AMPDU_AGG_LIMIT);
+  limit &= ~(kestrel::reg::B_AX_AMPDU_MAX_TIME_MSK
+             << kestrel::reg::B_AX_AMPDU_MAX_TIME_SH);
+  limit |= static_cast<uint32_t>(mode.enabled && mode.max_time
+                                     ? mode.max_time
+                                     : kestrel::reg::PTCL_AMPDU_MAX_TIME_8852B)
+           << kestrel::reg::B_AX_AMPDU_MAX_TIME_SH;
+  if (!_device.rtw_write32(kestrel::reg::R_AX_AMPDU_AGG_LIMIT, limit))
+    return false;
   if (_ba_cam_armed && (!mode.enabled || mode.no_ack ||
                         mode.tid != _ampdu.tid)) {
     if (!_hal.configure_ba_responder(_ampdu.tid, false)) return false;
@@ -800,14 +809,6 @@ bool RtlKestrelDevice::SetAmpduMode(const devourer::AmpduMode &mode) {
     if (!_hal.configure_ba_responder(mode.tid, true)) return false;
     _ba_cam_armed = true;
   }
-  uint32_t limit = _device.rtw_read32(kestrel::reg::R_AX_AMPDU_AGG_LIMIT);
-  limit &= ~(kestrel::reg::B_AX_AMPDU_MAX_TIME_MSK
-             << kestrel::reg::B_AX_AMPDU_MAX_TIME_SH);
-  limit |= static_cast<uint32_t>(mode.enabled && mode.max_time
-                                     ? mode.max_time
-                                     : kestrel::reg::PTCL_AMPDU_MAX_TIME_8852B)
-           << kestrel::reg::B_AX_AMPDU_MAX_TIME_SH;
-  _device.rtw_write32(kestrel::reg::R_AX_AMPDU_AGG_LIMIT, limit);
   _ampdu = mode;
   _logger->info("Kestrel: A-MPDU {} tid={} max={} density={} time=0x{:02x}",
                 mode.enabled ? "on" : "off", mode.tid, mode.max_num,
@@ -819,6 +820,7 @@ void RtlKestrelDevice::ClearAmpduMode() { (void)SetAmpduMode({}); }
 
 bool RtlKestrelDevice::ConfigureAckPeer(const devourer::MacAddr &local,
                                         const devourer::MacAddr &peer) {
+  std::lock_guard lock(_tx_packet_mutex);
   const auto valid = [](const devourer::MacAddr &mac) {
     return (mac.bytes[0] & 1U) == 0 &&
            std::any_of(mac.bytes.begin(), mac.bytes.end(),
@@ -827,6 +829,11 @@ bool RtlKestrelDevice::ConfigureAckPeer(const devourer::MacAddr &local,
   if (_variant != kestrel::ChipVariant::C8852B || !valid(local) ||
       !valid(peer) || local.bytes == peer.bytes)
     return false;
+  // A new peer must start with a fresh BlockAck window, even on the same TID.
+  if (_ba_cam_armed) {
+    if (!_hal.configure_ba_responder(_ampdu.tid, false)) return false;
+    _ba_cam_armed = false;
+  }
   if (!_hal.register_ap_role(local.bytes.data()) ||
       !_hal.set_port_net_type(kestrel::reg::MAC_AX_NET_TYPE_AP))
     return false;
@@ -839,11 +846,19 @@ bool RtlKestrelDevice::ConfigureAckPeer(const devourer::MacAddr &local,
 }
 
 void RtlKestrelDevice::ClearAckPeer() {
-  (void)_hal.configure_ba_responder(_ampdu.tid, false);
-  (void)_hal.register_sta_role(0, 0, 0);
-  (void)_hal.add_self_sta(kInjectSA, /*macid=*/0);
+  std::lock_guard lock(_tx_packet_mutex);
+  if (_ba_cam_armed) {
+    if (!_hal.configure_ba_responder(_ampdu.tid, false))
+      throw std::runtime_error("Kestrel BA peer clear failed");
+    _ba_cam_armed = false;
+  }
+  if (!_hal.register_sta_role(0, 0, 0) ||
+      !_hal.set_port_net_type(kestrel::reg::MAC_AX_NET_TYPE_NO_LINK) ||
+      !_hal.add_self_sta(kInjectSA, /*macid=*/0))
+    throw std::runtime_error("Kestrel ACK peer clear failed");
   _cfg.rx.ack_responder.reset();
   _cfg.rx.ack_peer.reset();
+  _ampdu.no_ack = true;
 }
 
 devourer::AmpduMode RtlKestrelDevice::GetAmpduMode() {
@@ -1215,6 +1230,7 @@ bool RtlKestrelDevice::StartSounding(const devourer::SoundingConfig &cfg) {
 }
 
 devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
+  std::lock_guard lock(_tx_packet_mutex);
   devourer::AdapterCaps c;
   c.supported = true;
   c.generation = devourer::ChipGeneration::Kestrel;
@@ -1559,9 +1575,8 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
   const int rl = _cfg.tx.retry_limit < 0    ? 0
                  : _cfg.tx.retry_limit > 62 ? 62
                                             : _cfg.tx.retry_limit;
-  const bool ampdu = is_data && _ampdu.enabled && flen >= 26 &&
-                     (frame[0] & 0x80) != 0 &&
-                     (frame[24] & 0x0f) == _ampdu.tid;
+  const bool ampdu = is_data && _ampdu.enabled &&
+                     kestrel::data_tid(frame, flen) == _ampdu.tid;
   const int txcnt = ampdu && _ampdu.no_ack ? 1 : rl + 1;
   std::vector<uint8_t> tx_buf;
   const auto seq = _tx_seq.fetch_add(1, std::memory_order_relaxed) & 0xfff;
@@ -1618,7 +1633,7 @@ size_t RtlKestrelDevice::send_packets(const TxPacketView *pkts,
    * (15 WDs). The previous host cap of 8 split every ~25-frame socket batch
    * across four USB2 transfers. */
   const size_t max_frames = std::min<size_t>(_cfg.tx.usb_agg_max, 15);
-  if (max_frames < 2)
+  if (!_device.is_usb() || max_frames < 2)
     return IRadio::send_packets(pkts, count);
   /* The AX USB aggregation header is a DMA_TXAGG_NUM field in the first WD;
    * only same-endpoint data frames can share one bulk transfer. */

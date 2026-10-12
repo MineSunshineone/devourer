@@ -235,7 +235,6 @@ private:
    * radio/session layer. */
   void rx_spur_k(uint8_t channel);
   void rx_dck();
-  void tssi_calibrate(uint8_t channel);
   void tssi_program_de(uint8_t channel);
   void tssi_program_codewords(uint8_t channel);
 

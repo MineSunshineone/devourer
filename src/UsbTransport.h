@@ -121,10 +121,8 @@ public:
   TxStats tx_stats() const override;
 
 private:
-  /* libusb permits multiple transfers on a context, but this backend's
-   * synchronous bulk-OUT path shares one handle/endpoint and one data toggle.
-   * Serialize it across Devourer's TX feeder threads. */
-  std::mutex _tx_sync_mu;
+  // Serialize each endpoint's frame boundary while independent queues can run.
+  std::array<std::mutex, 16> _tx_sync_mu;
   std::atomic<bool> _tx_needs_reinit{false};
 
   template <typename T> T ctrl_read(uint16_t reg);

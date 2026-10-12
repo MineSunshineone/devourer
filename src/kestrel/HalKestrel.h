@@ -256,8 +256,7 @@ public:
     uint32_t v = _device.rtw_read32(reg::R_AX_PORT_CFG_P0);
     v = reg::set_clr_word(v, net_type, reg::B_AX_NET_TYPE_P0_MSK,
                           reg::B_AX_NET_TYPE_P0_SH);
-    _device.rtw_write32(reg::R_AX_PORT_CFG_P0, v);
-    return true;
+    return _device.rtw_write32(reg::R_AX_PORT_CFG_P0, v);
   }
 
   bool configure_ba_responder(uint8_t tid, bool valid) {

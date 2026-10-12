@@ -3,8 +3,11 @@
 
 #include <atomic>
 #include <barrier>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 namespace {
@@ -14,6 +17,10 @@ int first_actual = 0;
 int failures = 0;
 libusb_transfer *pending = nullptr;
 unsigned async_calls = 0;
+bool parallel_probe = false;
+int probe_active = 0, probe_peak = 0, probe_entered = 0;
+std::mutex probe_mutex;
+std::condition_variable probe_ready;
 
 #define CHECK(condition) do { if (!(condition)) { \
   std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #condition); \
@@ -46,6 +53,10 @@ void scenario(int rc, int actual, bool poisoned, bool concurrent = false) {
     CHECK(a == (rc ? rc : actual));
     CHECK(poisoned ? b < 0 : b == static_cast<int>(sizeof(bytes)));
   }
+  if (poisoned) {
+    CHECK(transport.tx_sync_data(6, bytes, sizeof(bytes), 500) < 0);
+    CHECK(!transport.tx_async(6, bytes, sizeof(bytes), 500));
+  }
   CHECK(calls == (poisoned ? 1 : 2));
   CHECK(transport.tx_stats().needs_reinit == poisoned);
   CHECK(transport.tx_stats().submitted == static_cast<unsigned>(calls.load()));
@@ -53,6 +64,30 @@ void scenario(int rc, int actual, bool poisoned, bool concurrent = false) {
   CHECK(transport.tx_stats().last_error_rc ==
         (rc ? rc : actual < 1000 ? devourer::kTxShortWriteRc : 0));
   CHECK(transport.tx_stats().last_was_timeout == (rc == LIBUSB_ERROR_TIMEOUT));
+}
+
+void endpoint_scenario(bool same_endpoint) {
+  auto logger = std::make_shared<Logger>();
+  logger->set_level(Logger::Level::Silent);
+  devourer::UsbTransport transport(
+      reinterpret_cast<libusb_device_handle *>(1), logger, nullptr, {}, true,
+      devourer::RxMode::Async, 0, 0, devourer::PoolExhaust::Backpressure, true);
+  parallel_probe = true;
+  probe_active = probe_peak = probe_entered = 0;
+  unsigned char bytes[1000]{};
+  std::barrier start(2);
+  int a = 0, b = 0;
+  std::thread worker([&] {
+    start.arrive_and_wait();
+    a = transport.tx_sync_data(8, bytes, sizeof(bytes), 500);
+  });
+  start.arrive_and_wait();
+  b = transport.tx_sync_data(same_endpoint ? 8 : 6, bytes, sizeof(bytes), 500);
+  worker.join();
+  parallel_probe = false;
+  CHECK(a == 1000 && b == 1000);
+  CHECK(probe_peak == (same_endpoint ? 1 : 2));
+  CHECK(!transport.tx_stats().needs_reinit);
 }
 }  // namespace
 
@@ -93,6 +128,16 @@ extern "C" int LIBUSB_CALL libusb_bulk_transfer(
     libusb_device_handle *, unsigned char, unsigned char *, int length,
     int *actual, unsigned timeout) {
   CHECK(timeout == 0);  // Keep the production multi-packet no-cancel policy.
+  if (parallel_probe) {
+    std::unique_lock lock(probe_mutex);
+    probe_peak = std::max(probe_peak, ++probe_active);
+    ++probe_entered;
+    probe_ready.notify_all();
+    probe_ready.wait_for(lock, std::chrono::milliseconds(100), [] { return probe_entered == 2; });
+    --probe_active;
+    *actual = length;
+    return 0;
+  }
   if (calls.fetch_add(1) == 0) {
     *actual = first_actual;
     return first_rc;
@@ -135,6 +180,8 @@ void async_scenario(libusb_transfer_status status, int actual, bool poisoned) {
 }
 
 int main() {
+  endpoint_scenario(false);
+  endpoint_scenario(true);
   scenario(LIBUSB_ERROR_IO, 512, true);
   scenario(LIBUSB_ERROR_TIMEOUT, 512, true);
   scenario(0, 512, true);
