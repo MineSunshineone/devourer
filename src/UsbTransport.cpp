@@ -1406,6 +1406,8 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
 int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
                           int timeout_ms) {
   std::lock_guard<std::mutex> tx_lock(_tx_sync_mu);
+  if (_tx_needs_reinit.load(std::memory_order_relaxed))
+    return LIBUSB_ERROR_IO;
   flush_writes();
   /* No libusb_clear_halt here. rtw88_8814au's usbmon shows the first bulk
    * OUT is preceded by 0 CLEAR_FEATUREs; later CLEAR_FEATUREs happen during
@@ -1415,6 +1417,9 @@ int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
   _tx_submitted.fetch_add(1, std::memory_order_relaxed);
   int rc = libusb_bulk_transfer(_dev_handle, ep, packet,
                                 static_cast<int>(length), &actual, timeout_ms);
+  // A later transfer could complete this half-frame with unrelated bytes.
+  if (actual > 0 && static_cast<size_t>(actual) < length)
+    _tx_needs_reinit.store(true, std::memory_order_relaxed);
   if (rc != LIBUSB_SUCCESS) {
     _tx_failed.fetch_add(1, std::memory_order_relaxed);
     _tx_last_rc.store(rc, std::memory_order_relaxed);
@@ -1461,6 +1466,7 @@ TxStats UsbTransport::tx_stats() const {
   s.last_was_timeout = _tx_last_timeout.load(std::memory_order_relaxed);
   const int inflight = _tx_inflight.load(std::memory_order_relaxed);
   s.inflight = inflight > 0 ? static_cast<uint32_t>(inflight) : 0;
+  s.needs_reinit = _tx_needs_reinit.load(std::memory_order_relaxed);
   return s;
 }
 

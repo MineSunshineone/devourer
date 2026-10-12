@@ -125,6 +125,7 @@ private:
    * synchronous bulk-OUT path shares one handle/endpoint and one data toggle.
    * Serialize it across Devourer's TX feeder threads. */
   std::mutex _tx_sync_mu;
+  std::atomic<bool> _tx_needs_reinit{false};
 
   template <typename T> T ctrl_read(uint16_t reg);
   template <typename T> bool ctrl_write(uint16_t reg, T value);

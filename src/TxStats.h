@@ -42,6 +42,8 @@ struct TxStats {
   int last_error_rc = 0;      /* raw libusb rc / negated transfer status /
                                * kTxShortWriteRc */
   bool last_was_timeout = false;
+  // A synchronous partial bulk-OUT left a frame boundary open; recreate the transport.
+  bool needs_reinit = false;
 };
 
 } // namespace devourer

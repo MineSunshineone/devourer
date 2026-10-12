@@ -1246,6 +1246,13 @@ target_include_directories(BulkOutTimeoutSelftest PRIVATE
 
 add_test(NAME bulk_out_timeout COMMAND BulkOutTimeoutSelftest)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(UsbPartialWriteSelftest tests/usb_partial_write_selftest.cpp)
+    target_compile_features(UsbPartialWriteSelftest PRIVATE cxx_std_20)
+    target_link_libraries(UsbPartialWriteSelftest PRIVATE devourer PkgConfig::libusb)
+    add_test(NAME usb_partial_write COMMAND UsbPartialWriteSelftest)
+endif()
+
 # Headless guard for the NHM utility reduction (src/NhmEnvMath.h): bucket
 # weights, the rounded ratio helper shared with CLM, and the noise-floor-cluster
 # exclusion that makes nhm_env_ratio usable where the naive ratio rails. Pure
