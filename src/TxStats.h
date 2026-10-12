@@ -37,9 +37,13 @@ struct TxStats {
    * between calls and reports 0. A per-frame telemetry field, not a health
    * signal: it is what the receiver sees as "depth". */
   uint32_t inflight = 0;
+  uint64_t async_completed = 0; /* bulk-OUT callbacks reaped, including failures */
+  uint32_t async_inflight = 0;  /* submitted bulk-OUT callbacks still pending */
   int last_error_rc = 0;      /* raw libusb rc / negated transfer status /
                                * kTxShortWriteRc */
   bool last_was_timeout = false;
+  // A partial bulk-OUT left a frame boundary open; recreate the transport.
+  bool needs_reinit = false;
 };
 
 } // namespace devourer

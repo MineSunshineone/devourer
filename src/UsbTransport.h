@@ -8,6 +8,7 @@
  * that discovers the bulk endpoints. The exclusive per-adapter UsbDeviceLock
  * rides here too — its lifetime is the transport's. */
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -120,6 +121,12 @@ public:
   TxStats tx_stats() const override;
 
 private:
+  /* libusb permits multiple transfers on a context, but this backend's
+   * synchronous bulk-OUT path shares one handle/endpoint and one data toggle.
+   * Serialize it across Devourer's TX feeder threads. */
+  std::mutex _tx_sync_mu;
+  std::atomic<bool> _tx_needs_reinit{false};
+
   template <typename T> T ctrl_read(uint16_t reg);
   template <typename T> bool ctrl_write(uint16_t reg, T value);
   /* Pipelined-write machinery (see ITransport::write_batch_begin). */
@@ -233,6 +240,7 @@ private:
    * The async transfer_callback increments them from the libusb event thread. */
   std::atomic<uint64_t> _tx_submitted{0};
   std::atomic<uint64_t> _tx_failed{0};
+  std::atomic<uint64_t> _tx_async_completed{0};
   std::atomic<int> _tx_last_rc{0};
   std::atomic<bool> _tx_last_timeout{false};
 
@@ -247,6 +255,7 @@ private:
    * before the device handle / context go away, and so a soft cap can throttle
    * over-submission. */
   std::atomic<int> _tx_inflight{0};
+  std::array<std::atomic<int>, 16> _tx_ep_inflight{};
 
   /* Submitted-but-not-yet-completed transfers, so quiesce_tx can cancel them
    * by handle. transfer_callback removes its own entry, and it runs on

@@ -10,7 +10,7 @@ namespace kestrel {
 /* AX TX descriptor composer (wd_body_t 24B + wd_info_t 24B) for a band-0
  * management frame on USB, ported verbatim from mac_ax txdes_proc_mgnt_8852b
  * (mac_8852b/trx_desc_8852b.c). Only the fields a fixed-rate monitor/mgmt TX
- * needs are set; everything else is 0 (no security / aggregation / RTS). The
+ * needs are set; everything else is 0 (no security / RTS). The
  * mgmt queue (MAC_AX_DMA_B0MG=8) maps to USB BULKOUTID0 per
  * get_bulkout_id_8852b, so the caller sends this to the 0th bulk-OUT endpoint. */
 
@@ -21,8 +21,10 @@ constexpr uint8_t CH_DMA_SH = 16;          /* wd_body dword0 [19:16] */
 constexpr uint32_t WDINFO_EN = 1u << 22;   /* wd_body dword0 */
 constexpr uint8_t TXPKTSIZE_SH = 0;        /* wd_body dword2 [13:0] */
 constexpr uint8_t QSEL_SH = 17;            /* wd_body dword2 [22:17] */
+constexpr uint32_t TID_IND = 1u << 23;     /* wd_body dword2 */
 constexpr uint8_t MACID_SH = 24;           /* wd_body dword2 [30:24] */
 constexpr uint8_t WIFI_SEQ_SH = 0;         /* wd_body dword3 [11:0] */
+constexpr uint32_t AGG_EN = 1u << 12;      /* wd_body dword3 */
 constexpr uint32_t USERATE_SEL = 1u << 30; /* wd_info dword0 (force f_rate) */
 /* 8852C wd_body_t_v1: the rate word (USERATE_SEL/BW/GI/DATARATE) moved OUT of
  * wd_info dword0 into wd_body dword7 (offset 28), and USERATE_SEL is BIT(31)
@@ -53,6 +55,7 @@ constexpr uint32_t BMC = 1u << 11;         /* wd_info dword1: broadcast/multicas
  * is not ported here either. */
 constexpr uint32_t DATA_TXCNT_LMT_SEL = 1u << 31; /* wd_info dword1 */
 constexpr uint8_t DATA_TXCNT_LMT_SH = 25;         /* wd_info dword1 [30:25] */
+constexpr uint8_t AMPDU_DENSITY_SH = 18;          /* wd_info dword2 [20:18] */
 } /* namespace txd */
 
 /* Map a devourer MGN_* rate (RateDefinitions.h) to the AX_TXD_DATARATE encoding
@@ -174,7 +177,8 @@ inline uint32_t wd_info_dword1(const uint8_t *frame, uint32_t frame_len,
   return d1;
 }
 
-inline std::vector<uint8_t> build_mgnt_txdesc(const uint8_t *frame,
+inline void build_mgnt_txdesc_into(std::vector<uint8_t> &buf,
+                                   const uint8_t *frame,
                                               uint32_t frame_len,
                                               const TxRate &r, uint8_t macid,
                                               uint16_t seq,
@@ -186,7 +190,7 @@ inline std::vector<uint8_t> build_mgnt_txdesc(const uint8_t *frame,
    * A short WD desyncs the MAC TX parser and the frame never airs (buffer still
    * drains). wd_info + frame follow the WD body. */
   const uint32_t txd_len = wd_body_len + WD_INFO_LEN;
-  std::vector<uint8_t> buf(txd_len + frame_len, 0);
+  buf.assign(txd_len + frame_len, 0);
   uint8_t *wd = buf.data();
 
   /* wd_body dword0: [STF_MODE] | CH_DMA=B0MG | WDINFO_EN (usb_pkt_ofst=0).
@@ -219,16 +223,88 @@ inline std::vector<uint8_t> build_mgnt_txdesc(const uint8_t *frame,
   put_txdesc_rate(wd, wd_body_len, r);
 
   std::memcpy(wd + txd_len, frame, frame_len);
+}
+
+inline std::vector<uint8_t> build_mgnt_txdesc(const uint8_t *frame,
+                                              uint32_t frame_len,
+                                              const TxRate &r, uint8_t macid,
+                                              uint16_t seq,
+                                              uint32_t wd_body_len = WD_BODY_LEN,
+                                              int txcnt_lmt = -1,
+                                              bool stf_mode = true) {
+  std::vector<uint8_t> buf;
+  build_mgnt_txdesc_into(buf, frame, frame_len, r, macid, seq, wd_body_len,
+                         txcnt_lmt, stf_mode);
   return buf;
 }
 
 constexpr uint8_t MAC_AX_DATA_CH0 = 0; /* AC0 (best-effort) DMA channel */
 
-/* Build the AX data-frame TX descriptor (txdes_proc_data_8852b), best-effort
- * (TID 0 -> qsel 0, band 0, wmm 0, no security / aggregation / shortcut).
- * Differs from the mgmt path only in wd_body dword0 CH_DMA=DATA_CH0 and dword2
- * QSEL=0; the wd_info rate fields are identical. The AC0 queue maps to USB
- * BULKOUTID3, so the caller sends this to the 4th bulk-OUT endpoint. */
+inline uint8_t data_tid(const uint8_t *frame, uint32_t frame_len) {
+  if (frame_len < 26 || (frame[0] & 0x8c) != 0x88) return 0;
+  const uint32_t offset = (frame[1] & 3) == 3 ? 30 : 24;
+  if (frame_len < offset + 2) return 0;
+  const uint8_t tid = frame[offset] & 0xf;
+  return tid < 8 ? tid : 0;
+}
+
+inline uint8_t data_qsel(const uint8_t *frame, uint32_t frame_len) {
+  constexpr uint8_t queues[8]{0, 1, 1, 0, 2, 2, 3, 3};
+  return queues[data_tid(frame, frame_len)];
+}
+
+inline uint8_t data_macid(const uint8_t *frame, uint32_t frame_len,
+                           const uint8_t *peer) {
+  return peer && frame_len >= 10 && std::memcmp(frame + 4, peer, 6) == 0 ? 1 : 0;
+}
+
+/* Vendor band-0/WMM0 QoS mapping. 8852B AC0..3 use BULKOUTID3..6;
+ * 8852C keeps its existing DMA endpoint while selecting the MAC queue. */
+inline void build_data_txdesc_into(std::vector<uint8_t> &buf,
+                                   const uint8_t *frame,
+                                              uint32_t frame_len,
+                                              const TxRate &r, uint8_t macid,
+                                              uint16_t seq,
+                                              uint32_t wd_body_len = WD_BODY_LEN,
+                                              int txcnt_lmt = -1,
+                                              uint8_t ampdu_max_num = 0,
+                                              uint8_t ampdu_density = 0,
+                                              bool stf_mode = true) {
+  const uint32_t txd_len = wd_body_len + WD_INFO_LEN;
+  buf.assign(txd_len + frame_len, 0);
+  uint8_t *wd = buf.data();
+  const uint8_t tid = data_tid(frame, frame_len);
+  const uint8_t qsel = data_qsel(frame, frame_len);
+  constexpr uint8_t indicators[8]{0, 0, 1, 1, 0, 1, 0, 1};
+  const uint8_t dma = stf_mode && wd_body_len == WD_BODY_LEN
+                          ? qsel : MAC_AX_DATA_CH0;
+  txd_put_le32(wd + 0, (stf_mode ? txd::STF_MODE : 0u) | txd::WDINFO_EN |
+                           (static_cast<uint32_t>(dma)
+                            << txd::CH_DMA_SH));
+  /* dword1 = shcut_camid = 0 */
+  /* dword2: TXPKTSIZE | QSEL/TID_IND | MACID. */
+  txd_put_le32(wd + 8,
+               (static_cast<uint32_t>(frame_len & 0x3fff) << txd::TXPKTSIZE_SH) |
+                   (static_cast<uint32_t>(qsel) << txd::QSEL_SH) |
+                   (indicators[tid] ? txd::TID_IND : 0) |
+                   (static_cast<uint32_t>(macid & 0x7f) << txd::MACID_SH));
+  /* Vendor trx_desc_8852b.c: AGG_EN in body dword3; max count is encoded
+   * as N-1 in info dword1, density in info dword2. */
+  txd_put_le32(wd + 12, (static_cast<uint32_t>(seq & 0xfff) << txd::WIFI_SEQ_SH) |
+                            (ampdu_max_num ? txd::AGG_EN : 0));
+  /* wd_info dword1: BMC + per-frame TX-count limit. */
+  if (const uint32_t d1 = wd_info_dword1(frame, frame_len, txcnt_lmt) |
+                          (ampdu_max_num ? ampdu_max_num - 1u : 0u))
+    txd_put_le32(wd + wd_body_len + 4, d1);
+  if (ampdu_max_num)
+    txd_put_le32(wd + wd_body_len + 8,
+                 static_cast<uint32_t>(ampdu_density & 7u)
+                     << txd::AMPDU_DENSITY_SH);
+  /* Rate fields: same split as mgmt (V1 -> wd_body dword7, else wd_info d0). */
+  put_txdesc_rate(wd, wd_body_len, r);
+  std::memcpy(wd + txd_len, frame, frame_len);
+}
+
 inline std::vector<uint8_t> build_data_txdesc(const uint8_t *frame,
                                               uint32_t frame_len,
                                               const TxRate &r, uint8_t macid,
@@ -236,26 +312,9 @@ inline std::vector<uint8_t> build_data_txdesc(const uint8_t *frame,
                                               uint32_t wd_body_len = WD_BODY_LEN,
                                               int txcnt_lmt = -1,
                                               bool stf_mode = true) {
-  const uint32_t txd_len = wd_body_len + WD_INFO_LEN;
-  std::vector<uint8_t> buf(txd_len + frame_len, 0);
-  uint8_t *wd = buf.data();
-  /* dword0: [STF_MODE] | CH_DMA=DATA_CH0(0) | WDINFO_EN (STF = USB only). */
-  txd_put_le32(wd + 0, (stf_mode ? txd::STF_MODE : 0u) | txd::WDINFO_EN |
-                           (static_cast<uint32_t>(MAC_AX_DATA_CH0)
-                            << txd::CH_DMA_SH));
-  /* dword1 = shcut_camid = 0 */
-  /* dword2: TXPKTSIZE | QSEL=0 (TID0 AC_BE) | MACID. */
-  txd_put_le32(wd + 8,
-               (static_cast<uint32_t>(frame_len & 0x3fff) << txd::TXPKTSIZE_SH) |
-                   (static_cast<uint32_t>(macid & 0x7f) << txd::MACID_SH));
-  /* dword3: WIFI_SEQ (no ampdu_en). */
-  txd_put_le32(wd + 12, static_cast<uint32_t>(seq & 0xfff) << txd::WIFI_SEQ_SH);
-  /* wd_info dword1: BMC + per-frame TX-count limit (same as mgmt). */
-  if (const uint32_t d1 = wd_info_dword1(frame, frame_len, txcnt_lmt))
-    txd_put_le32(wd + wd_body_len + 4, d1);
-  /* Rate fields: same split as mgmt (V1 -> wd_body dword7, else wd_info d0). */
-  put_txdesc_rate(wd, wd_body_len, r);
-  std::memcpy(wd + txd_len, frame, frame_len);
+  std::vector<uint8_t> buf;
+  build_data_txdesc_into(buf, frame, frame_len, r, macid, seq, wd_body_len,
+                         txcnt_lmt, 0, 0, stf_mode);
   return buf;
 }
 

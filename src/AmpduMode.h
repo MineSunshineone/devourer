@@ -21,7 +21,8 @@
  *      sets it) is worth ~+40% on the aggregated path (8822B-proven).
  *
  * WHICH FRAMES the descriptor half applies to: DATA frames. On Jaguar3 that
- * is enforced - management and control frames keep their own queue (QSEL
+ * is enforced - QoS frames keep their own TID and only the configured TID
+ * uses aggregation; management and control frames keep their own queue (QSEL
  * 0x12, HIGH), retry limit and no AGG_EN (jaguar3::tx_qsel, pinned by
  * tests/txqueue_selftest.cpp). Jaguar1 and Jaguar2 still stamp it on every
  * frame they send; over USB every frame rides one bulk-OUT endpoint there

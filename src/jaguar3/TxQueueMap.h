@@ -84,6 +84,28 @@ constexpr uint8_t tx_qsel(bool is_data, size_t n_eps, bool ampdu_enabled,
   return static_cast<uint8_t>(q & 0x1f);
 }
 
+struct TxFrameQueue {
+  uint8_t qsel;
+  bool ampdu;
+};
+
+inline TxFrameQueue tx_frame_queue(const uint8_t *frame, size_t length,
+                                   size_t n_eps, bool ampdu_enabled,
+                                   uint8_t ampdu_tid, int debug_qsel) {
+  const bool data = frame != nullptr && length != 0 && dot11_is_data(frame[0]);
+  const bool qos = data && (frame[0] & 0x80) != 0;
+  int tid = -1;
+  if (qos && length >= 2) {
+    const size_t offset = (frame[1] & 3) == 3 ? 30 : 24;
+    if (length >= offset + 2 && (frame[offset] & 0x0f) <= 7)
+      tid = frame[offset] & 0x0f;
+  }
+  // Preserve the frame's queue; another TID cannot use this session's BA context.
+  return {tx_qsel(data, n_eps, ampdu_enabled,
+                 tid >= 0 ? static_cast<uint8_t>(tid) : ampdu_tid, debug_qsel),
+          data && ampdu_enabled && (!qos || tid == ampdu_tid)};
+}
+
 } // namespace jaguar3
 
 #endif /* JAGUAR3_TX_QUEUE_MAP_H */

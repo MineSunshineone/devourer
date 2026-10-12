@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "BulkOutTimeout.h"
+#include "RxTransferLength.h"
 #include "Event.h"
 #include "UsbDeviceLock.h"
 #include "UsbOpen.h"
@@ -38,6 +39,7 @@ inline void atomic_max(std::atomic<long long> &m, long long v) {
 struct AsyncRxShared {
   const std::function<void(const uint8_t *, int)> *cb;
   const std::function<bool()> *stop;
+  Logger_t logger;
   /* Atomic: in co-running (TX + self-capture RX) mode both the RX loop's own
    * event pump and the TX event loop may run this callback, so `active` is
    * written from the pump thread while the loop below reads it. */
@@ -146,6 +148,10 @@ inline void rx_consume(AsyncRxShared *s, const uint8_t *buf, int len) {
 
 extern "C" void LIBUSB_CALL devourer_rx_cb(libusb_transfer *t) {
   auto *s = static_cast<AsyncRxShared *>(t->user_data);
+  if (t->status != LIBUSB_TRANSFER_COMPLETED &&
+      t->status != LIBUSB_TRANSFER_TIMED_OUT && !(*s->stop)())
+    s->logger->error("RX: bulk-IN transfer error status={} actual_length={}",
+                     static_cast<int>(t->status), t->actual_length);
   if (t->status == LIBUSB_TRANSFER_NO_DEVICE)
     s->dead.store(true, std::memory_order_relaxed);
   /* This URB just completed — it has left the wire until resubmitted. */
@@ -158,8 +164,11 @@ extern "C" void LIBUSB_CALL devourer_rx_cb(libusb_transfer *t) {
   }
   const bool resubmit = !(*s->stop)() &&
                         (t->status == LIBUSB_TRANSFER_COMPLETED ||
-                         t->status == LIBUSB_TRANSFER_TIMED_OUT);
-  const int rlen = t->status == LIBUSB_TRANSFER_COMPLETED ? t->actual_length : 0;
+                         t->status == LIBUSB_TRANSFER_TIMED_OUT ||
+                         /* xHCI can report a transient -EPROTO as ERROR;
+                          * retiring every affected URB eventually empties RX. */
+                         t->status == LIBUSB_TRANSFER_ERROR);
+  const int rlen = rx_transfer_length(t->status, t->actual_length, t->length);
 
   if (s->reorder) {
     uint8_t *received = t->buffer;
@@ -739,6 +748,7 @@ void UsbTransport::rx_loop(
   const bool reorder = _rx_mode == RxMode::ReorderPool;
   const bool spsc = _rx_mode == RxMode::SpscFat;
   AsyncRxShared sh{&on_data, &should_stop};
+  sh.logger = _logger;
   sh.telemetry = _ring_ms > 0;
   sh.reorder = reorder;
   sh.spsc = spsc;
@@ -1151,8 +1161,14 @@ void UsbTransport::transfer_callback(struct libusb_transfer *transfer) {
     /* A CANCELLED completion is quiesce_tx doing its job, not a failure —
      * counting it would show phantom drops at the end of every session. */
     if (transfer->status != LIBUSB_TRANSFER_CANCELLED) {
+      if (transfer->actual_length > 0 &&
+          transfer->actual_length < transfer->length)
+        self->_tx_needs_reinit.store(true, std::memory_order_relaxed);
       self->_tx_failed.fetch_add(1, std::memory_order_relaxed);
-      self->_tx_last_rc.store(-transfer->status, std::memory_order_relaxed);
+      self->_tx_last_rc.store(
+          transfer->status == LIBUSB_TRANSFER_COMPLETED
+              ? kTxShortWriteRc : -transfer->status,
+          std::memory_order_relaxed);
       self->_tx_last_timeout.store(
           transfer->status == LIBUSB_TRANSFER_TIMED_OUT,
           std::memory_order_relaxed);
@@ -1175,10 +1191,13 @@ void UsbTransport::transfer_callback(struct libusb_transfer *transfer) {
   /* The payload is transport-owned (allocated in tx_async) — free it with the
    * allocator that made it, never libusb's LIBUSB_TRANSFER_FREE_BUFFER: on
    * Windows a separately-linked libusb frees onto a different CRT heap. */
+  const auto endpoint = transfer->endpoint & 0x0f;
   std::free(transfer->buffer);
   libusb_free_transfer(transfer);
   /* Last, so a quiesce_tx loop that sees _tx_inflight == 0 knows every buffer
    * and transfer is already freed and nothing more will touch this object. */
+  self->_tx_async_completed.fetch_add(1, std::memory_order_relaxed);
+  self->_tx_ep_inflight[endpoint].fetch_sub(1, std::memory_order_relaxed);
   self->_tx_inflight.fetch_sub(1, std::memory_order_release);
 }
 
@@ -1240,23 +1259,41 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
   /* Refused before the pump below, so a late send can't re-enter libusb after
    * teardown has begun. Counts as neither submitted nor failed: a frame handed
    * to us after we were told to stop is not a drop. */
-  if (_tx_shutdown.load(std::memory_order_acquire))
+  if (_tx_shutdown.load(std::memory_order_acquire) ||
+      _tx_needs_reinit.load(std::memory_order_relaxed))
     return false;
+  auto& endpoint_inflight = _tx_ep_inflight[tx_ep & 0x0f];
   {
     struct timeval zero {0, 0};
     libusb_handle_events_timeout_completed(_ctx, &zero, nullptr);
-    /* Soft cap: keep at most kMaxInflight transfers pending. Beyond it, wait
-     * for completions rather than pile onto the kernel queue. */
-    constexpr int kMaxInflight = 256;
-    while (_tx_inflight.load(std::memory_order_relaxed) >= kMaxInflight) {
-      struct timeval tv {0, 2000};
+    // Bound bulk backlog without consuming the independent control endpoint's slots.
+    constexpr int kMaxInflight = 16;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(2);
+    for (;;) {
+      if (_tx_shutdown.load(std::memory_order_acquire) ||
+          _tx_needs_reinit.load(std::memory_order_relaxed)) return false;
+      auto count = endpoint_inflight.load(std::memory_order_relaxed);
+      if (count < kMaxInflight && endpoint_inflight.compare_exchange_strong(
+              count, count + 1, std::memory_order_relaxed)) break;
+      const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+          deadline - std::chrono::steady_clock::now());
+      if (remaining.count() <= 0) return false;
+      if (count < kMaxInflight) continue;
+      struct timeval tv {0, static_cast<long>(remaining.count())};
       if (libusb_handle_events_timeout_completed(_ctx, &tv, nullptr) != 0)
-        break; /* don't spin forever on a libusb error */
+        return false;
     }
+  }
+  if (_tx_shutdown.load(std::memory_order_acquire) ||
+      _tx_needs_reinit.load(std::memory_order_relaxed)) {
+    endpoint_inflight.fetch_sub(1, std::memory_order_relaxed);
+    return false;
   }
 
   libusb_transfer *transfer = libusb_alloc_transfer(0);
   if (!transfer) {
+    endpoint_inflight.fetch_sub(1, std::memory_order_relaxed);
     _logger->error("Failed to allocate transfer");
     return false;
   }
@@ -1268,6 +1305,7 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
    * libusb_alloc_transfer above it and the kernel's own copy at submit. */
   auto *payload = static_cast<uint8_t *>(std::malloc(length));
   if (!payload) {
+    endpoint_inflight.fetch_sub(1, std::memory_order_relaxed);
     _logger->error("Failed to allocate TX payload ({} bytes)", length);
     libusb_free_transfer(transfer);
     return false;
@@ -1360,6 +1398,7 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
     if (it != _tx_live.end())
       _tx_live.erase(it);
   }
+  endpoint_inflight.fetch_sub(1, std::memory_order_relaxed);
   _tx_inflight.fetch_sub(1, std::memory_order_relaxed);
   _tx_failed.fetch_add(1, std::memory_order_relaxed);
   _tx_last_rc.store(rc, std::memory_order_relaxed);
@@ -1375,6 +1414,9 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
 
 int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
                           int timeout_ms) {
+  std::lock_guard<std::mutex> tx_lock(_tx_sync_mu);
+  if (_tx_needs_reinit.load(std::memory_order_relaxed))
+    return LIBUSB_ERROR_IO;
   flush_writes();
   /* No libusb_clear_halt here. rtw88_8814au's usbmon shows the first bulk
    * OUT is preceded by 0 CLEAR_FEATUREs; later CLEAR_FEATUREs happen during
@@ -1384,6 +1426,9 @@ int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
   _tx_submitted.fetch_add(1, std::memory_order_relaxed);
   int rc = libusb_bulk_transfer(_dev_handle, ep, packet,
                                 static_cast<int>(length), &actual, timeout_ms);
+  // A later transfer could complete this half-frame with unrelated bytes.
+  if (actual > 0 && static_cast<size_t>(actual) < length)
+    _tx_needs_reinit.store(true, std::memory_order_relaxed);
   if (rc != LIBUSB_SUCCESS) {
     _tx_failed.fetch_add(1, std::memory_order_relaxed);
     _tx_last_rc.store(rc, std::memory_order_relaxed);
@@ -1407,7 +1452,7 @@ int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
                    (int)length);
     return actual;
   }
-  _logger->info("bulk_send EP {} OK {} bytes", (int)ep, actual);
+  _logger->trace("bulk_send EP {} OK {} bytes", (int)ep, actual);
   return actual;
 }
 
@@ -1423,10 +1468,14 @@ TxStats UsbTransport::tx_stats() const {
   TxStats s;
   s.submitted = _tx_submitted.load(std::memory_order_relaxed);
   s.failed = _tx_failed.load(std::memory_order_relaxed);
+  s.async_completed = _tx_async_completed.load(std::memory_order_relaxed);
+  s.async_inflight = static_cast<uint32_t>(
+      std::max(0, _tx_inflight.load(std::memory_order_relaxed)));
   s.last_error_rc = _tx_last_rc.load(std::memory_order_relaxed);
   s.last_was_timeout = _tx_last_timeout.load(std::memory_order_relaxed);
   const int inflight = _tx_inflight.load(std::memory_order_relaxed);
   s.inflight = inflight > 0 ? static_cast<uint32_t>(inflight) : 0;
+  s.needs_reinit = _tx_needs_reinit.load(std::memory_order_relaxed);
   return s;
 }
 

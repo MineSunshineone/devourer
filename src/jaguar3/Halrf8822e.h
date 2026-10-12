@@ -34,6 +34,8 @@ public:
   void pwr_track() override;
   void set_pwr_track_ctx(uint8_t thermal_base_a, uint8_t thermal_base_b,
                          uint8_t channel) override;
+  void set_tssi_efuse_map(const uint8_t *map, size_t len) override;
+  void configure_tssi(uint8_t channel) override;
   void force_wl_antenna() override;
   void coex_wlan_only_init() override;
   void coex_run_5g() override;
@@ -228,6 +230,15 @@ private:
    * write it to the BB TX-power-adjust register (0x18a0/0x41a0[7:0]). */
   void thermal_track_8822e();
 
+  /* Vendor RFK prologue/epilogue for RTL8822E.  These are deliberately kept
+   * in the chip HAL: they touch live BB/RF state and must not leak into the
+   * radio/session layer. */
+  void rx_spur_k(uint8_t channel);
+  void rx_dck();
+  void tssi_calibrate(uint8_t channel);
+  void tssi_program_de(uint8_t channel);
+  void tssi_program_codewords(uint8_t channel);
+
 public:
   /* One-shot path-A meter read for GetThermalStatus (see Jaguar3Calibration):
    * shares the tracker's one-time RF 0x42[19] trigger; baseline = efuse 0xd0. */
@@ -235,6 +246,8 @@ public:
 
 private:
   uint8_t _therm_base[2] = {0xFF, 0xFF}; /* efuse 0xd0/0xd1 baseline per path */
+  int8_t _tssi_efuse[2][25] = {};
+  bool _tssi_efuse_valid = false;
   uint8_t _track_channel = 0;
   bool _tm_triggered = false;
   uint8_t _therm_avg[2][4] = {};         /* rolling avg buffer */

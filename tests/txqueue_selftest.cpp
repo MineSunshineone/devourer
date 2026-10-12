@@ -14,6 +14,7 @@
  * Prints the failing case and exits nonzero. */
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 
 #include "PktBufWindow.h"
 #if defined(DEVOURER_HAVE_JAGUAR3)
@@ -101,6 +102,34 @@ static void test_tx_qsel() {
         "ampdu VO data not NORMAL");
 }
 
+static void test_qos_frame_queue() {
+  uint8_t frame[32] = {0x88, 0};
+  for (uint8_t tid : {uint8_t(0), uint8_t(6)}) {
+    frame[24] = tid;
+    auto queue = jaguar3::tx_frame_queue(frame, 26, 3, true, 0, -1);
+    CHECK(queue.qsel == tid, "QoS TID %u overwritten with QSEL %u", tid, queue.qsel);
+    CHECK(queue.ampdu == (tid == 0), "QoS TID %u borrowed TID 0 BA context", tid);
+    CHECK(jaguar3::bulkout_id_for_qsel(queue.qsel, 3) == (tid == 0 ? 2 : 1),
+          "QoS TID %u used wrong USB endpoint", tid);
+  }
+  frame[1] = 3; frame[24] = 0; frame[30] = 6;
+  auto queue = jaguar3::tx_frame_queue(frame, 32, 3, true, 0, -1);
+  CHECK(queue.qsel == 6 && !queue.ampdu, "4-address QoS read Address 4 as TID");
+  CHECK(!jaguar3::tx_frame_queue(frame, 31, 3, true, 0, -1).ampdu,
+        "truncated QoS header enabled aggregation");
+  frame[1] = 0;
+  CHECK(!jaguar3::tx_frame_queue(frame, 25, 3, true, 0, -1).ampdu,
+        "truncated 3-address QoS header enabled aggregation");
+  frame[24] = 6;
+  queue = jaguar3::tx_frame_queue(frame, 26, 3, false, 0, -1);
+  CHECK(queue.qsel == 0 && !queue.ampdu, "disabled aggregation changed legacy queue");
+  queue = jaguar3::tx_frame_queue(frame, 26, 3, true, 0, 0x11);
+  CHECK(queue.qsel == 0x11 && !queue.ampdu, "debug override or BA isolation failed");
+  frame[0] = 0x80;
+  queue = jaguar3::tx_frame_queue(frame, 26, 3, true, 0, -1);
+  CHECK(queue.qsel == 0x12 && !queue.ampdu, "management frame entered data aggregation");
+}
+
 #endif /* DEVOURER_HAVE_JAGUAR3 */
 
 static void test_pktbuf_window() {
@@ -138,6 +167,7 @@ int main() {
 #if defined(DEVOURER_HAVE_JAGUAR3)
   test_queue_map();
   test_tx_qsel();
+  test_qos_frame_queue();
 #endif
   test_pktbuf_window();
   if (g_fail) {

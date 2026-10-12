@@ -242,6 +242,28 @@ public:
     return ok;
   }
 
+  /* Retarget the self ADDR_CAM/CCTL identity without changing the registered
+   * station role. This is the monitor-mode hardware ACK responder path. */
+  bool set_self_addr_cam(const uint8_t self_mac[6],
+                         uint8_t net_type = reg::MAC_AX_NET_TYPE_AP) {
+    bool ok = _fw.fw_upd_addr_cam(0, self_mac, net_type, 0, 0);
+    ok = _fw.fw_upd_cctl_basic(0, 0, reg::MAC_AX_OFDM6, 1, 0,
+                               net_type != reg::MAC_AX_NET_TYPE_AP) && ok;
+    return ok;
+  }
+
+  bool set_port_net_type(uint8_t net_type) {
+    uint32_t v = _device.rtw_read32(reg::R_AX_PORT_CFG_P0);
+    v = reg::set_clr_word(v, net_type, reg::B_AX_NET_TYPE_P0_MSK,
+                          reg::B_AX_NET_TYPE_P0_SH);
+    _device.rtw_write32(reg::R_AX_PORT_CFG_P0, v);
+    return true;
+  }
+
+  bool configure_ba_responder(uint8_t tid, bool valid) {
+    return _fw.fw_ba_cam(tid, /*macid=*/1, /*ssn=*/0, valid);
+  }
+
   /* Register the self MACID as an ACCESS POINT role (self_role=AP,
    * wifi_role=AP, net_type=AP), not a client. The fw's AP-side machinery — the
    * beacon engine AND the UL-OFDMA trigger scheduler — keys off the fw role;
@@ -366,6 +388,23 @@ public:
                                /*ntx_path_en=*/1, /*path_map_a=*/0,
                                /*bmc=*/false) &&
          ok;
+    return ok;
+  }
+
+  /* AX BlockAck peer: vendor AP_CLIENT role and a distinct peer TMA. */
+  bool register_ba_peer_sta(const uint8_t local_mac[6],
+                            const uint8_t peer_mac[6], uint8_t macid,
+                            uint8_t addr_cam_idx) {
+    bool ok = _fw.fw_role_maintain(macid, reg::MAC_AX_SELF_ROLE_AP_CLIENT,
+                                   reg::MAC_AX_WIFI_ROLE_STATION,
+                                   reg::MAC_AX_ROLE_CREATE, /*band=*/0,
+                                   /*port=*/0);
+    ok = _fw.fw_upd_addr_cam(macid, local_mac,
+                             reg::MAC_AX_NET_TYPE_AP, addr_cam_idx,
+                             /*bssid_cam_idx=*/0, peer_mac, local_mac) && ok;
+    ok = _fw.fw_upd_cctl_basic(macid, addr_cam_idx, reg::MAC_AX_OFDM6,
+                               /*ntx_path_en=*/1, /*path_map_a=*/0,
+                               /*bmc=*/false) && ok;
     return ok;
   }
 
@@ -612,6 +651,7 @@ public:
   int16_t _txpwr_dbm_q2 = 20 * 4; /* fixed BB TX power, s(9,2); 20 dBm default */
   int16_t _txpwr_offset_qdb = 0;  /* runtime offset (quarter-dB), sticky */
   bool _cca_on = false; /* carrier-sense TX default (8852C) / forced on */
+  bool _bt_grant = false;
   bool _cca_default_unmeasured = false; /* 8852B default-clear: warn, don't
                                          * pretend it's a choice */
 
@@ -705,6 +745,7 @@ public:
     _cca_default_unmeasured = default_unmeasured;
   }
   void set_kfr_ofld(bool on) { _kfr_ofld = on; }
+  void set_bt_grant(bool on) { _bt_grant = on; }
 };
 
 } /* namespace kestrel */

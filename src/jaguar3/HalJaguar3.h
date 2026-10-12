@@ -109,12 +109,10 @@ private:
   void monitor_rx_cfg();
 
 public:
-  /* Enable the BB/RF RX path (port of phydm config_trx_mode RX half:
-   * set_rf_mode_table + config_cck/ofdm_rx_path + bb_reset + igi_toggle, all
-   * BB_PATH_AB). The IGI toggle is mandatory — it forces the BB to emit the
-   * 3-wire command that puts the RF HW into RX mode; without it the RF never
-   * enters RX and the chip delivers zero frames. Call AFTER the channel/BW is
-   * set (the 3-wire RX-mode command must follow the channel config). */
+  /* Configure the BB/RF TRX path (port of phydm config_trx_mode_8822c):
+   * RF mode, eFuse-selected RX/TX mapping, BB reset and IGI toggle. The IGI
+   * toggle is mandatory — it forces the BB to emit the 3-wire command that
+   * puts the RF HW into RX mode. Call AFTER the channel/BW is set. */
   void enable_rx_path();
 
   /* Beamformer-side sounding RF/BB config (port of phydm_txbf_rfmode, the
@@ -124,16 +122,25 @@ public:
    * 8822E). Call when arming the self-sounding beamformer, after bring-up. */
   void txbf_rfmode_sounder();
 
-  /* Configure the 8822E RFE control pins (port of phydm_rfe_8822e). These drive
-   * the external antenna-switch / PAPE (PA enable) GPIOs and are only set for
-   * rfe_type 21..24; without them the TX PA is not enabled (TX dark) even when
-   * RX works. No-op for 8822C. Call after the channel is tuned. */
+  /* Configure the RFE control pins (port of phydm_rfe_8822c/8822e). These drive
+   * external antenna-switch / PAPE (PA enable) GPIOs for supported RFE types.
+   * Call after the channel is tuned and the TRX path is selected. */
   void config_rfe(uint8_t channel);
 
   /* Resolved efuse RFE type (8822E; 0/0xff already folded to the rfe-21
    * default in rtw_hal_init). The eFEM pin-mux gate keys on this, like the
    * kernel's _efem_pinmux_config (rfe 21..24). */
   uint8_t rfe_type() const { return _phy_ctx.rfe_type; }
+
+  /* RTL8822C vendor path bitmap from EFUSE 0xC9: high nibble TX, low nibble
+   * RX. 0x33 is the normal 2T2R default; 0x11/0x22 are 1T1R modules. */
+  uint8_t trx_path_bmp() const { return _trx_path_bmp; }
+
+  /* RTL8822E vendor board option: EFUSE 0xC1 bit 2 de-features the
+   * transmitter to one chain. Keep the hardware capability separate from the
+   * nominal 2T2R chip identity so rate negotiation cannot promise 2SS on a
+   * de-featured module. */
+  uint8_t tx_chain_limit() const { return _tx_chain_limit; }
 
   /* 8822E channel-finalize TX writes the shared (8822c-derived) set_channel_bwmode
    * omits: the band-specific OFDM Tx backoff / Tx scaling (5 GHz 0x818/0x81c) and
@@ -143,6 +150,10 @@ public:
    * Without the 5 GHz Tx-scaling write the EU's 5 GHz on-air power collapses
    * (~3 Mbps SDR duty vs the kernel's ~48). Call after config_rfe. No-op for 8822C. */
   void config_channel_8822e(uint8_t channel);
+
+  /* Vendor PHYDM runtime TRX path select for 8822E 5 GHz.  Keep the vendor
+   * order: RF mode -> RX map -> TX map -> RFE -> BB reset -> IGI toggle. */
+  void config_trx_mode_8822e(uint8_t channel);
 
   /* Put the DPK gain block in explicit bypass (port of _dpk_force_bypass_8822e).
    * The kernel force-bypasses DPK for RFE type 21/22 (the EU) instead of running
@@ -167,6 +178,7 @@ public:
   void coex_keepalive() { _cal->coex_keepalive(); }
   void coex_run_5g() { _cal->coex_run_5g(); }
   void pwr_track() { _cal->pwr_track(); }
+  void configure_tssi(uint8_t channel) { _cal->configure_tssi(channel); }
   /* One-shot thermal-meter read for GetThermalStatus (see Jaguar3Calibration).
    * Caller serializes against pwr_track (same RF 0x42 trigger RMW). */
   bool read_thermal(uint8_t &raw, uint8_t &baseline) {
@@ -218,6 +230,8 @@ private:
   void cache_efuse_8822e();
   uint8_t _efuse_cache[0x100];
   bool _efuse_cache_valid = false;
+  uint8_t _tx_chain_limit = 2;
+  uint8_t _trx_path_bmp = 0x33;
 
   /* EFUSE MAC (see perm_mac). Logical 0x157 sits past _efuse_cache, so the
    * 8822E capture decodes into a larger local buffer and copies both out —

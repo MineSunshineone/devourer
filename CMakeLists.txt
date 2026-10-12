@@ -1246,6 +1246,13 @@ target_include_directories(BulkOutTimeoutSelftest PRIVATE
 
 add_test(NAME bulk_out_timeout COMMAND BulkOutTimeoutSelftest)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(UsbPartialWriteSelftest tests/usb_partial_write_selftest.cpp)
+    target_compile_features(UsbPartialWriteSelftest PRIVATE cxx_std_20)
+    target_link_libraries(UsbPartialWriteSelftest PRIVATE devourer PkgConfig::libusb)
+    add_test(NAME usb_partial_write COMMAND UsbPartialWriteSelftest)
+endif()
+
 # Headless guard for the NHM utility reduction (src/NhmEnvMath.h): bucket
 # weights, the rounded ratio helper shared with CLM, and the noise-floor-cluster
 # exclusion that makes nhm_env_ratio usable where the naive ratio rails. Pure
@@ -1346,6 +1353,12 @@ if(DEVOURER_KESTREL)
     target_include_directories(KestrelTxReportSelftest PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME kestrel_txreport COMMAND KestrelTxReportSelftest)
+
+    add_executable(KestrelAmpduDescSelftest tests/kestrel_ampdu_desc_selftest.cpp)
+    target_compile_features(KestrelAmpduDescSelftest PRIVATE cxx_std_20)
+    target_include_directories(KestrelAmpduDescSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME kestrel_ampdu_desc COMMAND KestrelAmpduDescSelftest)
 
     # Golden-bytes guard for the trigger-UL + TWT H2C content encoders
     # (src/kestrel/SchedEncode.h): each config's emitted LE dwords vs the
@@ -1653,6 +1666,11 @@ target_link_libraries(TxQueueSelftest PRIVATE devourer)
 target_include_directories(TxQueueSelftest PRIVATE src)
 add_test(NAME txqueue_map COMMAND TxQueueSelftest)
 
+add_executable(RxTransferLengthSelftest tests/rx_transfer_length_selftest.cpp)
+target_link_libraries(RxTransferLengthSelftest PRIVATE devourer)
+target_include_directories(RxTransferLengthSelftest PRIVATE src)
+add_test(NAME rx_transfer_length COMMAND RxTransferLengthSelftest)
+
 # Headless guard for the beamforming-report decoder (src/BfReportDecode.h) — the
 # LSB-first Givens-angle unpacking + per-tone variance behind sense. It
 # decodes a real captured VHT MU report and checks the angles against an offline
@@ -1743,6 +1761,15 @@ target_link_libraries(ChanMigReplay PRIVATE devourer)
 # synthetic psi-variance spikes / SNR notches must localize to the right tone
 # group. The RF-side capture path is validated out-of-band (tests/rx_tone_localize.sh).
 find_package(Python3 COMPONENTS Interpreter)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING AND Python3_Interpreter_FOUND)
+    add_library(ChipstateNoClaimSpy SHARED tests/chipstate_no_claim_spy.cpp)
+    target_compile_features(ChipstateNoClaimSpy PRIVATE cxx_std_20)
+    target_link_libraries(ChipstateNoClaimSpy PRIVATE PkgConfig::libusb)
+    add_test(NAME chipstate_no_claim
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/chipstate_no_claim_test.py
+                $<TARGET_FILE:chipstate> $<TARGET_FILE:ChipstateNoClaimSpy>)
+endif()
+
 if(Python3_Interpreter_FOUND)
     add_test(
         NAME rx_tone_localize_math
@@ -1820,3 +1847,7 @@ foreach(_dvr_t IN LISTS _dvr_targets)
         add_dependencies(selftests ${_dvr_t})
     endif()
 endforeach()
+
+if(TARGET ChipstateNoClaimSpy)
+    add_dependencies(selftests chipstate ChipstateNoClaimSpy)
+endif()

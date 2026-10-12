@@ -50,6 +50,52 @@ static void put_desc(std::vector<uint8_t> &b, size_t off, uint32_t rpkt_len,
 }
 
 int main() {
+  // PHY reports follow their own PPDU; an adjacent report is not this frame's RSSI.
+  {
+    KestrelRxBatch batch;
+    std::array<uint8_t, 8> report{0x80, 1, 0, 170, 170, 168, 0, 0};
+    KestrelRxFrame data;
+    data.rpkt_type = RPKT_TYPE_WIFI;
+    data.ppdu_cnt = 7;
+    data.rx_rate = 0x87;
+    data.ppdu_type = 3;
+    KestrelRxFrame status = data;
+    status.rpkt_type = RPKT_TYPE_PPDU;
+    status.payload = report.data();
+    status.payload_len = report.size();
+    std::vector<uint8_t> powers;
+    const auto emit = [&](const KestrelRxFrame& f, const KestrelPhySts& phy) {
+      if (f.rpkt_type == RPKT_TYPE_WIFI) powers.push_back(phy.rssi[0]);
+    };
+    batch.push(data, false, emit);
+    batch.push(data, false, emit); // two subframes of one PPDU
+    CHECK(powers.empty());
+    batch.push(status, false, emit);
+    CHECK((powers == std::vector<uint8_t>{85, 85}));
+    data.ppdu_cnt = 0; // wrap, not the preceding PPDU
+    batch.push(data, false, emit);
+    batch.push(status, false, emit);
+    CHECK(powers.back() == 0);
+    status.ppdu_cnt = 0;
+    batch.push(status, false, emit); // orphan report cannot be cached for next data
+    batch.push(data, false, emit);
+    batch.finish(emit); // USB completion ends: data must not wait for a missing report
+    CHECK(powers.back() == 0);
+    batch.push(data, false, emit);
+    status.rx_rate = 0x86;
+    batch.push(status, false, emit);
+    CHECK(powers.back() == 0);
+    status.rx_rate = data.rx_rate;
+    report[0] = 0; // invalid status must not prove RSSI
+    batch.push(data, false, emit);
+    batch.push(status, false, emit);
+    CHECK(powers.back() == 0);
+    report[0] = 0x80;
+    batch.push(data, false, emit);
+    batch.push(status, false, emit);
+    CHECK(powers.back() == 85);
+    CHECK(powers.size() == 7);
+  }
   /* --- short descriptor, no drvinfo, no shift, a 100-byte WIFI frame --- */
   {
     std::vector<uint8_t> b(16 + 100, 0xAB);

@@ -625,6 +625,8 @@ constexpr uint8_t USR_TX_RPT_MODE_LAST_PKT = 2;
  * func=FWROLE_MAINTAIN. dword0 = MACID[7:0] | SELF_ROLE[9:8] | UPD_MODE[12:10]
  * | WIFI_ROLE[16:13] | BAND[18:17] | PORT[21:19]. */
 constexpr uint8_t FWCMD_H2C_CL_MEDIA_RPT = 0x8;
+constexpr uint8_t FWCMD_H2C_CL_BA_CAM = 0xC;
+constexpr uint8_t FWCMD_H2C_FUNC_BA_CAM = 0x0;
 constexpr uint8_t FWCMD_H2C_FUNC_FWROLE_MAINTAIN = 0x4;
 /* JOININFO (same MEDIA_RPT class, func 0): the fw "STA connected" op. One dword
  * w0 = MACID[7:0] | OP[8] (0=connect,1=disconnect) | BAND[9] | WMM[11:10] |
@@ -640,6 +642,7 @@ constexpr uint8_t H2C_FWROLE_PORT_SH = 19;      /* mask 0x7 */
 /* mac_ax_self_role. */
 constexpr uint8_t MAC_AX_SELF_ROLE_CLIENT = 0;
 constexpr uint8_t MAC_AX_SELF_ROLE_AP = 1;
+constexpr uint8_t MAC_AX_SELF_ROLE_AP_CLIENT = 2;
 /* mac_ax_wifi_role. */
 constexpr uint8_t MAC_AX_WIFI_ROLE_NONE = 0;
 constexpr uint8_t MAC_AX_WIFI_ROLE_STATION = 1;

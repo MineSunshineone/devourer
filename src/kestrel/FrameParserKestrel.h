@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 /* 11ax (Kestrel / G6 mac_ax) RX descriptor parser. Transcribed from
  * reference/rtl8852bu phl/hal_g6/mac/rxdesc.h + type.h (rxd_short_t 16B /
@@ -208,6 +209,45 @@ inline bool parse_physts_8852(const uint8_t *p, size_t len, bool is_8852c,
   }
   return true;
 }
+
+// Associate the trailing PHY report with its preceding PPDU, never the next one.
+// All payloads remain views into the current USB completion: no payload copy,
+// no wait for another completion. Missing reports leave signal fields unknown.
+class KestrelRxBatch {
+ public:
+  template <class Emit>
+  void push(const KestrelRxFrame& frame, bool is_8852c, const Emit& emit) {
+    if (frame.rpkt_type == RPKT_TYPE_WIFI) {
+      if (!pending_.empty() && !same_ppdu(pending_.front(), frame)) finish(emit);
+      pending_.push_back(frame);
+    } else if (frame.rpkt_type == RPKT_TYPE_PPDU) {
+      KestrelPhySts phy{};
+      if (!pending_.empty() && same_ppdu(pending_.front(), frame) &&
+          !frame.crc_err && !frame.icv_err && frame.payload_len >= 8 &&
+          frame.payload && (frame.payload[0] & 0x80))
+        parse_physts_8852(frame.payload, frame.payload_len, is_8852c, phy);
+      for (const auto& packet : pending_) emit(packet, phy);
+      pending_.clear();
+    } else {
+      emit(frame, KestrelPhySts{});
+    }
+  }
+
+  template <class Emit>
+  void finish(const Emit& emit) {
+    // ponytail: a PHY report split into the next USB completion loses this
+    // sample; preserve immediate data forwarding instead of buffering traffic.
+    for (const auto& packet : pending_) emit(packet, KestrelPhySts{});
+    pending_.clear();
+  }
+
+ private:
+  static bool same_ppdu(const KestrelRxFrame& a, const KestrelRxFrame& b) {
+    return a.ppdu_cnt == b.ppdu_cnt && a.rx_rate == b.rx_rate &&
+           a.ppdu_type == b.ppdu_type && a.bw == b.bw && a.gi_ltf == b.gi_ltf;
+  }
+  std::vector<KestrelRxFrame> pending_;
+};
 
 } /* namespace kestrel */
 
