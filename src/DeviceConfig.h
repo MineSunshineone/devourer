@@ -143,8 +143,8 @@ struct DeviceConfig {
      * mask (sticky across channel sets, see SetRxPathMask); the toggle form
      * "0xAA:0xBB[:0xCC]@<ms>" cycles masks on a timer thread. */
     std::optional<std::string> path_spec;
-    /* env: DEVOURER_RX_URBS — Jaguar1 async bulk-IN URB queue depth
-     * (default 8, clamped to >= 1). */
+    /* env: DEVOURER_RX_URBS — Jaguar1/Jaguar3 async bulk-IN URB queue depth
+     * (default 8, clamped to >= 1; Jaguar3 also caps at 64). */
     std::optional<int> urbs;
     /* env: DEVOURER_RX_URB_BYTES — per-URB bulk-IN buffer size on the 11ac
      * generations (default 16384, clamped to >= 4096). Keep it at 16 KB unless

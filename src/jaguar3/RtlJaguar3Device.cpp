@@ -493,7 +493,8 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
   int rx_urb_bytes = _cfg.rx.urb_bytes.value_or(16 * 1024);
   if (rx_urb_bytes < 4096)
     rx_urb_bytes = 4096;
-  _device.bulk_read_async_loop(rx_urb_bytes, 8, on_data, [this]() -> bool {
+  const int rx_urbs = std::clamp(_cfg.rx.urbs.value_or(8), 1, 64);
+  _device.bulk_read_async_loop(rx_urb_bytes, rx_urbs, on_data, [this]() -> bool {
     return _rx_stop || g_devourer_should_stop;
   });
   _rx_loop_active = false;
