@@ -1251,6 +1251,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_features(UsbPartialWriteSelftest PRIVATE cxx_std_20)
     target_link_libraries(UsbPartialWriteSelftest PRIVATE devourer PkgConfig::libusb)
     add_test(NAME usb_partial_write COMMAND UsbPartialWriteSelftest)
+    add_executable(UsbRxErrorLogSelftest tests/usb_rx_error_log_selftest.cpp)
+    target_compile_features(UsbRxErrorLogSelftest PRIVATE cxx_std_20)
+    target_link_libraries(UsbRxErrorLogSelftest PRIVATE devourer PkgConfig::libusb)
+    add_test(NAME usb_rx_error_log COMMAND UsbRxErrorLogSelftest)
 endif()
 
 # Headless guard for the NHM utility reduction (src/NhmEnvMath.h): bucket

@@ -44,6 +44,9 @@ struct AsyncRxShared {
    * event pump and the TX event loop may run this callback, so `active` is
    * written from the pump thread while the loop below reads it. */
   std::atomic<int> active{0};
+  // Count every transient error without flushing stderr for every failed URB.
+  std::atomic<unsigned long long> transfer_errors{0};
+  std::atomic<long long> next_error_log_ms{0};
 
   /* Diagnostic telemetry, populated only when `telemetry` (DEVOURER_RX_RING_MS
    * > 0) — the default path pays nothing. `armed` is the count of URBs
@@ -148,7 +151,17 @@ inline void rx_consume(AsyncRxShared *s, const uint8_t *buf, int len) {
 
 extern "C" void LIBUSB_CALL devourer_rx_cb(libusb_transfer *t) {
   auto *s = static_cast<AsyncRxShared *>(t->user_data);
-  if (t->status != LIBUSB_TRANSFER_COMPLETED &&
+  if (t->status == LIBUSB_TRANSFER_ERROR && !(*s->stop)()) {
+    const auto total = s->transfer_errors.fetch_add(1, std::memory_order_relaxed) + 1;
+    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    auto next = s->next_error_log_ms.load(std::memory_order_relaxed);
+    if (now >= next && s->next_error_log_ms.compare_exchange_strong(
+                           next, now + 1000, std::memory_order_relaxed))
+      s->logger->error("RX: bulk-IN transfer error status={} actual_length={} total={}",
+                       static_cast<int>(t->status), t->actual_length, total);
+  } else if (t->status != LIBUSB_TRANSFER_COMPLETED &&
       t->status != LIBUSB_TRANSFER_TIMED_OUT && !(*s->stop)())
     s->logger->error("RX: bulk-IN transfer error status={} actual_length={}",
                      static_cast<int>(t->status), t->actual_length);
@@ -955,6 +968,8 @@ void UsbTransport::rx_loop(
     if (consumer.joinable())
       consumer.join();
   }
+  if (const auto errors = sh.transfer_errors.load(std::memory_order_relaxed))
+    _logger->error("RX: bulk-IN transfer errors total={}", errors);
   /* All URBs are drained (sh.active == 0) — no transfer references a buffer and
    * the free-list is quiescent, so releasing the whole pool is safe. Ownership
    * is `bufs` (every buffer, including the ones reorder swapped onto transfers

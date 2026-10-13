@@ -10,6 +10,12 @@ Devourer's output is split into two planes:
 `rxdemo 2>/dev/null` therefore yields a pure JSONL stream; `2>&1` into one log
 is also safe — event parsers skip non-event lines.
 
+The asynchronous USB RX ring logs its first `LIBUSB_TRANSFER_ERROR` immediately,
+then at most once per second per ring, with a cumulative `total`. Ring shutdown
+emits the final total so the last suppressed burst remains counted. Other RX
+error statuses retain their individual diagnostics; this changes neither URB
+resubmission nor delivery of a valid received prefix.
+
 ## The event contract
 
 Every event line serializes the event name **first**, exactly:
