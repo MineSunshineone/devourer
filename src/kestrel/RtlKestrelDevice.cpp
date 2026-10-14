@@ -104,6 +104,19 @@ RtlKestrelDevice::~RtlKestrelDevice() {
    * belongs to every device: nothing gets released while a transfer the
    * transport still owns is outstanding. */
   _device.quiesce_tx();
+  Stop();
+}
+
+void RtlKestrelDevice::Stop() {
+  _ack_disarm_thread = {}; /* cancel + join a pending test disarm */
+  {
+    std::lock_guard ccx(busy_window_mutex());
+    if (!cancel_channel_busy_locked(devourer::BusySpoil::None))
+      _logger->warn("Kestrel: CCX measurement restore failed during stop");
+    // A later destructor may run after libusb_exit, so it cannot retry I/O.
+    _kestrel_busy = {};
+    _brought_up = false;
+  }
   _rx_stop = true;
   stop_wp_drain();
   pcie_quiesce();
@@ -197,6 +210,10 @@ bool RtlKestrelDevice::PowerOnTrxAndPhy(kestrel::EfuseInfo &out) {
 
 
 bool RtlKestrelDevice::BringUpMonitor(SelectedChannel channel) {
+  std::lock_guard ccx(busy_window_mutex());
+  _brought_up = false;
+  if (!cancel_channel_busy_locked(devourer::BusySpoil::None))
+    return false;
   _channel = channel;
   /* hal_start_8852b order (rtl8852b_halinit.c:508): mac_hal_init [pwr ->
    * FWDL -> enable_bb_rf -> sys_init -> trx_init -> intf_init] -> efuse ->
@@ -490,6 +507,9 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
 }
 
 void RtlKestrelDevice::SetMonitorChannel(SelectedChannel channel) {
+  std::lock_guard ccx(busy_window_mutex());
+  if (!cancel_channel_busy_locked(devourer::BusySpoil::Retuned))
+    throw std::runtime_error("Kestrel: CCX restore failed before retune");
   _channel = channel;
   _hal.set_channel(channel.Channel, channel.ChannelWidth, channel.ChannelOffset, channel.Band);
 }
@@ -713,6 +733,7 @@ void RtlKestrelDevice::arm_configured_ack_responder() {
 }
 
 RxEnergy RtlKestrelDevice::GetRxEnergy(bool with_nhm) {
+  std::lock_guard ccx(busy_window_mutex());
   RxEnergy e; /* no phydm FA/CCA/IGI DIG monitor on Kestrel */
   /* DEVOURER_RX_NOISE_FLOOR — active/frame-free absolute floor via the halbb NHM
    * env-monitor. Frame-free, BB-driven, no clock-stop -> no wedge.
@@ -731,6 +752,8 @@ RxEnergy RtlKestrelDevice::GetRxEnergy(bool with_nhm) {
       _variant == kestrel::ChipVariant::C8852B ||
       (_variant == kestrel::ChipVariant::C8852C && _channel.Channel <= 14);
   if (with_nhm && _cfg.rx.abs_noise_floor && nhm_supported) {
+    if (!cancel_channel_busy_locked(devourer::BusySpoil::Interrupted))
+      return e;
     int8_t nf = 0;
     if (_hal.nhm_noise_floor(nf) && nf <= -60 && nf >= -105) {
       e.abs_noise_floor_dbm = nf;
@@ -738,6 +761,35 @@ RxEnergy RtlKestrelDevice::GetRxEnergy(bool with_nhm) {
     }
   }
   return e;
+}
+
+bool RtlKestrelDevice::cancel_channel_busy_locked(devourer::BusySpoil reason) {
+  return _kestrel_busy.cancel(reason,
+      [this](uint32_t a) { return _device.rtw_read32_wide(a); },
+      [this](uint32_t a, uint32_t v) { return _device.rtw_write32_wide(a, v); });
+}
+
+uint32_t RtlKestrelDevice::ArmChannelBusy(uint32_t window_us) {
+  const auto tx = GetTxStats().submitted;
+  std::lock_guard ccx(busy_window_mutex());
+  // shortcut: verified on 8852B USB, 2.4 GHz / 20 MHz; extend after hardware validation.
+  if (!_brought_up || !_device.is_usb() ||
+      _variant != kestrel::ChipVariant::C8852B || _channel.Channel > 14 ||
+      _channel.ChannelWidth != CHANNEL_WIDTH_20)
+    return 0;
+  return _kestrel_busy.arm(window_us, tx,
+      [this](uint32_t a) { return _device.rtw_read32_wide(a); },
+      [this](uint32_t a, uint32_t v) { return _device.rtw_write32_wide(a, v); });
+}
+
+devourer::ChannelBusy RtlKestrelDevice::GetChannelBusy() {
+  const auto tx = GetTxStats().submitted;
+  std::lock_guard ccx(busy_window_mutex());
+  if (!_brought_up)
+    return {};
+  return _kestrel_busy.read(tx,
+      [this](uint32_t a) { return _device.rtw_read32_wide(a); },
+      [this](uint32_t a, uint32_t v) { return _device.rtw_write32_wide(a, v); });
 }
 
 devourer::RxQuality RtlKestrelDevice::GetRxQuality() {
@@ -757,6 +809,9 @@ void RtlKestrelDevice::FastRetune(uint8_t channel, bool /*cache_rf*/) {
     SetMonitorChannel(c);
     return;
   }
+  std::lock_guard ccx(busy_window_mutex());
+  if (!cancel_channel_busy_locked(devourer::BusySpoil::Retuned))
+    throw std::runtime_error("Kestrel: CCX restore failed before fast retune");
   _hal.fast_retune(channel);
   _channel.Channel = channel;
 }
@@ -771,6 +826,9 @@ void RtlKestrelDevice::FastSetBandwidth(ChannelWidth_t bw) {
     SetMonitorChannel(c);
     return;
   }
+  std::lock_guard ccx(busy_window_mutex());
+  if (!cancel_channel_busy_locked(devourer::BusySpoil::Retuned))
+    throw std::runtime_error("Kestrel: CCX restore failed before bandwidth change");
   _hal.fast_set_bw(bw);
   _channel.ChannelWidth = bw;
 }
@@ -1240,10 +1298,10 @@ devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
   c.tx_chains = 2; /* 8852B/8852C are 2T2R */
   c.rx_chains = 2;
   c.per_chain_rssi = true; /* per-path RSSI from the PPDU-status physts header */
-  /* No CLM: the G6 NHM rides the halbb env-monitor glue, not NhmReader, and
-   * that glue keeps only the noise floor — the vendor engine's clm_ratio is
-   * computed and discarded. No phydm FA/CCA/IGI monitor either. */
-  c.busy_airtime_ok = false;
+  std::lock_guard ccx(busy_window_mutex());
+  c.busy_airtime_ok = _brought_up && _device.is_usb() &&
+      _variant == kestrel::ChipVariant::C8852B && _channel.Channel <= 14 &&
+      _channel.ChannelWidth == CHANNEL_WIDTH_20;
   c.rx_energy_ok = false;
   /* Hardware ARQ: SetAckResponder arms on the 8852B -- a committed INFRA
    * station entry (HalKestrel::register_infra_sta), verified by CAM read-back.

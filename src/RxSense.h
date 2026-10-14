@@ -191,6 +191,12 @@ struct ChannelBusy {
   bool valid_energy = false;
   uint8_t energy_pct = 0;
 
+  /* Hardware time above the configured EDCCA threshold, independent of
+   * preamble CCA and NHM's noise-floor-relative energy. Overlaps busy_pct:
+   * do not add them. Invalid when this backend has no EDCCA timer. */
+  bool valid_edcca = false;
+  uint8_t edcca_pct = 0;
+
   /* Did the radio TRANSMIT inside the measured window, and how many frames.
    *
    * Carried rather than corrected, because the two families are biased in
@@ -217,8 +223,8 @@ struct ChannelBusy {
  * RxEnergy whose meaning survives leaving the Realtek family; everything else
  * is dropped on purpose. Yields valid=false for an energy read that carried
  * neither — a with_nhm=false read, or a generation with no CCX engine
- * (Kestrel's NHM rides halbb, not NhmReader, so it has no CLM; the RTL8733B
- * has no GetRxEnergy at all). */
+ * (Kestrel's NHM rides halbb, and its separate busy-window implementation
+ * bypasses this conversion; the RTL8733B has no GetRxEnergy at all). */
 inline ChannelBusy busy_from_rx_energy(const RxEnergy &e) {
   ChannelBusy b;
   if (!e.valid_clm)

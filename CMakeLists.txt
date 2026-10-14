@@ -1346,6 +1346,12 @@ add_test(NAME trigger_parse COMMAND TriggerParseSelftest)
 # (on-air decode is hardware-validated out-of-band). Compiled only when a
 # Kestrel variant is built (the header is under a compiled group).
 if(DEVOURER_KESTREL)
+    add_executable(KestrelBusySelftest tests/kestrel_busy_selftest.cpp)
+    target_compile_features(KestrelBusySelftest PRIVATE cxx_std_20)
+    target_include_directories(KestrelBusySelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME kestrel_busy COMMAND KestrelBusySelftest)
+
     add_executable(KestrelRxParseSelftest tests/kestrel_rxparse_selftest.cpp)
     target_link_libraries(KestrelRxParseSelftest PRIVATE devourer)
     target_include_directories(KestrelRxParseSelftest PRIVATE

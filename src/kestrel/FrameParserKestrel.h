@@ -210,7 +210,7 @@ inline bool parse_physts_8852(const uint8_t *p, size_t len, bool is_8852c,
   return true;
 }
 
-// Associate the trailing PHY report with its preceding PPDU, never the next one.
+// USB can put the PHY report before, among, or after frames of the same PPDU.
 // All payloads remain views into the current USB completion: no payload copy,
 // no wait for another completion. Missing reports leave signal fields unknown.
 class KestrelRxBatch {
@@ -219,15 +219,23 @@ class KestrelRxBatch {
   void push(const KestrelRxFrame& frame, bool is_8852c, const Emit& emit) {
     if (frame.rpkt_type == RPKT_TYPE_WIFI) {
       if (!pending_.empty() && !same_ppdu(pending_.front(), frame)) finish(emit);
-      pending_.push_back(frame);
+      if (has_report_ && same_ppdu(report_, frame)) {
+        emit(frame, phy_);
+      } else {
+        has_report_ = false;
+        pending_.push_back(frame);
+      }
     } else if (frame.rpkt_type == RPKT_TYPE_PPDU) {
       KestrelPhySts phy{};
-      if (!pending_.empty() && same_ppdu(pending_.front(), frame) &&
-          !frame.crc_err && !frame.icv_err && frame.payload_len >= 8 &&
+      if (!frame.crc_err && !frame.icv_err && frame.payload_len >= 8 &&
           frame.payload && (frame.payload[0] & 0x80))
         parse_physts_8852(frame.payload, frame.payload_len, is_8852c, phy);
-      for (const auto& packet : pending_) emit(packet, phy);
+      for (const auto& packet : pending_)
+        emit(packet, same_ppdu(packet, frame) ? phy : KestrelPhySts{});
       pending_.clear();
+      report_ = frame;
+      phy_ = phy;
+      has_report_ = true;
     } else {
       emit(frame, KestrelPhySts{});
     }
@@ -239,6 +247,7 @@ class KestrelRxBatch {
     // sample; preserve immediate data forwarding instead of buffering traffic.
     for (const auto& packet : pending_) emit(packet, KestrelPhySts{});
     pending_.clear();
+    has_report_ = false;
   }
 
  private:
@@ -247,6 +256,9 @@ class KestrelRxBatch {
            a.ppdu_type == b.ppdu_type && a.bw == b.bw && a.gi_ltf == b.gi_ltf;
   }
   std::vector<KestrelRxFrame> pending_;
+  KestrelRxFrame report_{};
+  KestrelPhySts phy_{};
+  bool has_report_ = false;
 };
 
 } /* namespace kestrel */

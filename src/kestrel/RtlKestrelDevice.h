@@ -20,6 +20,7 @@
 #include "SelectedChannel.h"
 
 #include "ChipVariant.h"
+#include "BusyWindowKestrel.h"
 #include "FrameParserKestrel.h" /* KestrelPhySts (cached per-path phy-status) */
 #include "HalKestrel.h"
 
@@ -69,12 +70,7 @@ public:
    * libusb_exit runs trips libusb's usbi_mutex_destroy assertion (SIGABRT at
    * demo shutdown). The destructor joins too, but the demos destroy the
    * device object after libusb_exit, so Stop() is the ordered join point. */
-  void Stop() override {
-    _ack_disarm_thread = {}; /* cancel + join a pending test disarm */
-    _rx_stop = true;
-    stop_wp_drain();
-    pcie_quiesce();
-  }
+  void Stop() override;
   void SetMonitorChannel(SelectedChannel channel) override;
   /* Disable / restore the MAC carrier-sense gate (R_AX_CCA_CFG_0 all-CCA-EN:
    * primary + sec20/40/80 + EDCCA). Injection is already CCA-off by default here
@@ -200,6 +196,8 @@ public:
    * absolute noise floor (halbb NHM env-monitor) when DEVOURER_RX_NOISE_FLOOR is
    * set — there is no phydm FA/CCA/IGI DIG monitor on this generation. */
   RxEnergy GetRxEnergy(bool with_nhm) override;
+  uint32_t ArmChannelBusy(uint32_t window_us) override;
+  devourer::ChannelBusy GetChannelBusy() override;
   /* Windowed RX link-quality: the passive rssi-snr floor + LinkHealth verdict
    * (fed per frame via _rxq) fused with the active NHM floor from GetRxEnergy. */
   devourer::RxQuality GetRxQuality() override;
@@ -290,10 +288,10 @@ private:
   SelectedChannel _channel{};
   kestrel::EfuseInfo _efuse{};
   volatile bool _rx_stop = false;
-  /* WP-release drain (Kestrel STF USB): the fw returns each transmitted frame's
-   * WD/PLE pages as an RX packet (rpkt_type=7, TX_PD_RELEASE_HOST) on the bulk-
-   * IN. A TX-only path must still drain the bulk-IN or the pages never recycle
-   * and the mgmt bulk-OUT stalls after ~103 frames. InitWrite starts this
+  /* TX-only bulk-IN drain: received frames and PHY/C2H traffic still arrive.
+   * Host WP status reports (rpkt_type=7) are optional and disabled by the
+   * USB/STF defaults. Without draining, TX-only can stall after ~103 frames.
+   * InitWrite starts this
    * background drain; StartRxLoop hands the bulk-IN over to itself (which also
    * drains type-7), so the two never read the endpoint concurrently. */
   std::thread _wp_drain_thread;
@@ -326,6 +324,8 @@ private:
   std::jthread _ack_disarm_thread;
   /* DEVOURER_ACK_RESPONDER: arm at the end of bring-up, throw if refused. */
   void arm_configured_ack_responder();
+  kestrel::BusyWindow _kestrel_busy;
+  bool cancel_channel_busy_locked(devourer::BusySpoil reason);
   uint8_t _tx_mgmt_q = 0;
   uint8_t _tx_data_q = 0;
   bool _tx_data_ok = false;

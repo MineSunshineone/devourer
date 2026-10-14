@@ -83,9 +83,9 @@ public:
    * backend's answer is the same function of its GetRxEnergy. A generation
    * that overrides GetRxEnergy gets this for free; one that does not gets a
    * correct "no reading" instead of a fabricated zero — which is the right
-   * answer for the RTL8733B (no override at all) and for Kestrel (whose
-   * GetRxEnergy fills only the absolute noise floor: its NHM rides the halbb
-   * glue, not NhmReader, so there is no CLM).
+   * answer for the RTL8733B (no override at all). Kestrel overrides this
+   * with its separately armed CLM/EDCCA window; its HALBB NHM noise-floor
+   * reading does not provide these counters.
    *
    * Left non-final on purpose: CLM's period field is independent of the NHM
    * window and reaches ~262 ms, so a generation may later want a longer,

@@ -29,8 +29,8 @@ static void check(const char *what, long got, long want) {
 int main() {
   /* --- RxEnergy -> ChannelBusy --- */
   {
-    /* No CLM in the read: a with_nhm=false read, a generation with no CCX
-     * engine (Kestrel), or one that implements no GetRxEnergy at all (the
+    /* No CLM in the read: a with_nhm=false read, a separate busy-window
+     * implementation (Kestrel), or no GetRxEnergy implementation at all (the
      * RTL8733B, whose CLM answers only through an armed window). Not a quiet
      * channel. */
     RxEnergy e;
@@ -54,6 +54,7 @@ int main() {
     check("clm window_us", b.window_us, 2000); /* 500 ticks * 4 us */
     check("clm energy invalid", b.valid_energy, 0);
     check("clm energy zeroed", b.energy_pct, 0);
+    check("clm does not invent EDCCA", b.valid_edcca, 0);
   }
   {
     /* CLM + NHM: both halves present. */

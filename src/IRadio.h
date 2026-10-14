@@ -712,7 +712,7 @@ public:
    * airtime (both silicon families count it in hardware) plus, where the
    * family has one, the share of energy above the receiver's own floor.
    *
-   * Delta semantics: the window drains on read. On the Realtek backends this
+   * Delta semantics: the window drains on read. On the Jaguar backends this
    * is IMPLEMENTED BY GetRxEnergy(true), so GetRxEnergy, GetRxQuality and this
    * all consume the same counters — poll one of the three, not two.
    *
@@ -720,6 +720,9 @@ public:
    * measurement window and polls a ready bit at 1 ms granularity, while the
    * MediaTek path is two register reads. A caller written against the cheap
    * one will stall on the expensive one; this is a dwell-cadence call.
+   * Kestrel requires an explicit arm, returns invalid when unarmed, and
+   * never waits for the measurement to finish. Its separate valid_edcca /
+   * edcca_pct fields describe threshold-based busy time, not NHM energy.
    *
    * The Realtek-only phydm detail (false-alarm classes, DIG/IGI, the NHM
    * histogram) stays on IRtlRadio::GetRxEnergy; this is its portable
@@ -734,6 +737,7 @@ public:
    * on its own. Returns the window ACTUALLY armed in microseconds (the
    * hardware's granularity and limits clamp it, so a caller that needs to
    * know its own denominator reads the return value, not its request);
+   * Kestrel's validated 8852B USB / 2.4 GHz / 20 MHz path clamps to 20–240 ms.
    * 0 means this backend cannot arm one and the caller should keep using the
    * sampled GetChannelBusy() path.
    *

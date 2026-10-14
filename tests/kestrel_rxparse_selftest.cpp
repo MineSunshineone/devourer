@@ -50,7 +50,7 @@ static void put_desc(std::vector<uint8_t> &b, size_t off, uint32_t rpkt_len,
 }
 
 int main() {
-  // PHY reports follow their own PPDU; an adjacent report is not this frame's RSSI.
+  // A matching report can precede the frame; adjacent PPDUs must remain separate.
   {
     KestrelRxBatch batch;
     std::array<uint8_t, 8> report{0x80, 1, 0, 170, 170, 168, 0, 0};
@@ -77,19 +77,21 @@ int main() {
     batch.push(status, false, emit);
     CHECK(powers.back() == 0);
     status.ppdu_cnt = 0;
-    batch.push(status, false, emit); // orphan report cannot be cached for next data
+    batch.push(status, false, emit); // leading report for this same PPDU
     batch.push(data, false, emit);
     batch.finish(emit); // USB completion ends: data must not wait for a missing report
-    CHECK(powers.back() == 0);
+    CHECK(powers.back() == 85);
     batch.push(data, false, emit);
     status.rx_rate = 0x86;
     batch.push(status, false, emit);
     CHECK(powers.back() == 0);
+    batch.finish(emit);
     status.rx_rate = data.rx_rate;
     report[0] = 0; // invalid status must not prove RSSI
     batch.push(data, false, emit);
     batch.push(status, false, emit);
     CHECK(powers.back() == 0);
+    batch.finish(emit);
     report[0] = 0x80;
     batch.push(data, false, emit);
     batch.push(status, false, emit);
@@ -296,6 +298,64 @@ int main() {
     p2.snr_avg = 44;
     CHECK(!parse_physts_8852(b.data(), 4, true, p2)); /* below header size */
     CHECK(p2.rssi[0] == 0 && p2.snr_avg == 0);
+  }
+
+  // USB captures contain both leading and trailing reports for the same PPDU.
+  for (bool is_8852c : {false, true}) {
+    std::array<uint8_t, 8> blob{0x80, 1, 0, 120, 130, 110, 0, 0};
+    KestrelRxFrame wifi{};
+    wifi.rpkt_type = RPKT_TYPE_WIFI;
+    wifi.ppdu_cnt = 3;
+    wifi.rx_rate = 135;
+    wifi.ppdu_type = 3;
+    wifi.freerun_cnt = 123;
+    KestrelRxFrame report = wifi;
+    report.rpkt_type = RPKT_TYPE_PPDU;
+    report.payload = blob.data();
+    report.payload_len = blob.size();
+    const auto run = [&](std::initializer_list<KestrelRxFrame> input) {
+      KestrelRxBatch batch;
+      std::vector<uint8_t> signal;
+      const auto emit = [&](const KestrelRxFrame& frame, const KestrelPhySts& phy) {
+        CHECK(frame.rpkt_type == RPKT_TYPE_WIFI && frame.freerun_cnt == 123);
+        signal.push_back(phy.rssi[0]);
+      };
+      for (const auto& frame : input) batch.push(frame, is_8852c, emit);
+      batch.finish(emit);
+      return signal;
+    };
+    CHECK(run({wifi, wifi, report}) == std::vector<uint8_t>({65, 65}));
+    CHECK(run({report, wifi, wifi}) == std::vector<uint8_t>({65, 65}));
+    CHECK(run({wifi, report, wifi}) == std::vector<uint8_t>({65, 65}));
+    std::array<KestrelRxFrame, 5> other{wifi, wifi, wifi, wifi, wifi};
+    ++other[0].ppdu_cnt;
+    ++other[1].rx_rate;
+    ++other[2].ppdu_type;
+    ++other[3].bw;
+    ++other[4].gi_ltf;
+    for (const auto& frame : other) {
+      CHECK(run({report, frame}) == std::vector<uint8_t>({0}));
+      CHECK(run({frame, report, wifi}) == std::vector<uint8_t>({0, 65}));
+    }
+    KestrelRxBatch batch;
+    std::vector<uint8_t> signal;
+    const auto emit = [&](const KestrelRxFrame&, const KestrelPhySts& phy) {
+      signal.push_back(phy.rssi[0]);
+    };
+    batch.push(report, is_8852c, emit);
+    batch.finish(emit);
+    batch.push(wifi, is_8852c, emit);
+    batch.finish(emit);
+    CHECK(signal == std::vector<uint8_t>({0}));
+    for (int invalid = 0; invalid < 4; ++invalid) {
+      auto bad = report;
+      bad.crc_err = invalid == 0;
+      bad.icv_err = invalid == 1;
+      if (invalid == 2) bad.payload_len = 7;
+      blob[0] = invalid == 3 ? 0 : 0x80;
+      CHECK(run({bad, wifi}) == std::vector<uint8_t>({0}));
+      CHECK(run({wifi, bad}) == std::vector<uint8_t>({0}));
+    }
   }
 
   if (failures == 0)

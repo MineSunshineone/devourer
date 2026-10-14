@@ -1546,9 +1546,9 @@ void HalKestrel::set_host_rpr() {
   field32(r::R_AX_WDRLS_CFG,
           poh ? r::MAC_AX_RPR_MODE_POH : r::MAC_AX_RPR_MODE_STF,
           r::B_AX_WDRLS_MODE_MSK, r::B_AX_WDRLS_MODE_SH);
-  /* RLSRPT0_CFG0 filter map: rpr_cfg_stf has every filter DISabled (clear the
-   * bits so every TX result generates a release report); rpr_cfg_poh has them
-   * all ENabled (set the bits). The 8852C also selects the report's
+  /* USB/STF defaults disable all host TX-status selections; PCIe/POH
+   * enables them. The vendor USB rls_rpt_en diagnostic also sets these
+   * bits to enable reports. The 8852C also selects the report's
    * destination queue per mode (WDRLS_DEST_QID_STF / _POH). */
   const uint32_t fltr = r::B_WDRLS_FLTR_TXOK | r::B_WDRLS_FLTR_RTYLMT |
                         r::B_WDRLS_FLTR_LIFTIM | r::B_WDRLS_FLTR_MACID;

@@ -248,7 +248,8 @@ constexpr uint32_t DLE_WAIT_US = 1;
  * WD/PLE pages after a frame is transmitted. WITHOUT this, RLSRPT0 sits at its
  * reset default and the fw batches page releases badly, so the mgmt bulk-OUT
  * pool fills (~103 frames at 210 turbo pages / 2) and NAKs. The STF (USB) cfg:
- * WDRLS_MODE=STF, clear the RLSRPT0 filter map, AGGNUM=121 + TO=255 (the
+ * WDRLS_MODE=STF, clear host TX-status selections (reports off by default),
+ * AGGNUM=121 + TO=255 (the
  * timeout is what actually releases pages before the pool caps). */
 constexpr uint16_t R_AX_WDRLS_CFG = 0x9408;
 constexpr uint8_t B_AX_WDRLS_MODE_SH = 0;

@@ -58,6 +58,11 @@ int main() {
   auto regs = std::make_shared<FakeRegs>();
   RtlAdapter adapter(regs, logger);
   RtlKestrelDevice radio(adapter, logger, kestrel::ChipVariant::C8852B);
+  CHECK(radio.ArmChannelBusy(100000) == 0);
+  CHECK(!radio.GetChannelBusy().valid);
+  radio.Stop();
+  CHECK(radio.ArmChannelBusy(100000) == 0);
+  CHECK(!radio.GetChannelBusy().valid);
   devourer::MacAddr local{{2, 0, 0, 0, 0, 1}}, a{{2, 0, 0, 0, 0, 2}}, b{{2, 0, 0, 0, 0, 3}};
   devourer::AmpduMode mode;
   mode.enabled = true;
