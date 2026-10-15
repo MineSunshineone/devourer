@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// BXI modification 2026-10-16: verify dynamic peer ACK responder lifecycle.
 #include "kestrel/RtlKestrelDevice.h"
 #include "kestrel/KestrelLe.h"
 
@@ -44,6 +45,19 @@ class FakeRegs final : public devourer::ITransport {
                const std::function<bool()> &) override {}
 };
 
+class PeerKestrel final : public RtlKestrelDevice {
+ public:
+  using RtlKestrelDevice::RtlKestrelDevice;
+  bool fail_ack = false;
+  std::optional<devourer::MacAddr> responder;
+  bool SetAckResponder(const devourer::MacAddr &mac) override {
+    if (fail_ack) return false;
+    responder = mac;
+    return true;
+  }
+  void ClearAckResponder() override { responder.reset(); }
+};
+
 class CountingKestrel final : public RtlKestrelDevice {
  public:
   using RtlKestrelDevice::RtlKestrelDevice;
@@ -57,7 +71,7 @@ int main() {
   logger->set_level(Logger::Level::Silent);
   auto regs = std::make_shared<FakeRegs>();
   RtlAdapter adapter(regs, logger);
-  RtlKestrelDevice radio(adapter, logger, kestrel::ChipVariant::C8852B);
+  PeerKestrel radio(adapter, logger, kestrel::ChipVariant::C8852B);
   CHECK(radio.ArmChannelBusy(100000) == 0);
   CHECK(!radio.GetChannelBusy().valid);
   radio.Stop();
@@ -68,12 +82,14 @@ int main() {
   mode.enabled = true;
   mode.no_ack = false;
   CHECK(radio.ConfigureAckPeer(local, a));
+  CHECK(radio.responder && radio.responder->bytes == local.bytes);
   CHECK(radio.SetAmpduMode(mode));
   CHECK(regs->ba == std::vector<bool>{true});
   CHECK(radio.ConfigureAckPeer(local, b));
   CHECK(radio.SetAmpduMode(mode));
   CHECK((regs->ba == std::vector<bool>{true, false, true}));
   radio.ClearAckPeer();
+  CHECK(!radio.responder);
   CHECK((regs->read32(r::R_AX_PORT_CFG_P0) >> r::B_AX_NET_TYPE_P0_SH & r::B_AX_NET_TYPE_P0_MSK) == r::MAC_AX_NET_TYPE_NO_LINK);
   CHECK(radio.GetAmpduMode().no_ack);
   CHECK(radio.ConfigureAckPeer(local, a));
@@ -108,6 +124,15 @@ int main() {
   CHECK(threw);
   regs->fail_reg = 0xffff;
   radio.ClearAckPeer();
+
+  radio.fail_ack = true;
+  CHECK(!radio.ConfigureAckPeer(local, b));
+  CHECK(!radio.responder);
+  radio.fail_ack = false;
+  CHECK(radio.ConfigureAckPeer(local, b));
+  CHECK(radio.responder && radio.responder->bytes == local.bytes);
+  radio.ClearAckPeer();
+  CHECK(!radio.responder);
 
   // A PCIe batch must retain the per-MPDU virtual dispatch, even with a USB knob.
   regs->usb = false;

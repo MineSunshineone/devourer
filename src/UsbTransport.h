@@ -1,4 +1,5 @@
 #pragma once
+// BXI modification 2026-10-15: bound USB read recovery and track failed register writes.
 
 /* UsbTransport — the libusb implementation of ITransport. Everything
  * USB-wire-specific that used to live inside the adapter is here: vendor
@@ -10,8 +11,10 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <libusb.h>
@@ -62,12 +65,16 @@ public:
                               static_cast<uint16_t>(addr >> 16), &v, sizeof(v)))
       return true;
     _ctrl_xfers.fetch_add(1, std::memory_order_relaxed);
-    const bool ok =
-        libusb_control_transfer(
+    const int result = libusb_control_transfer(
                _dev_handle, REALTEK_USB_VENQT_WRITE, 5,
                static_cast<uint16_t>(addr & 0xFFFF),
                static_cast<uint16_t>(addr >> 16), (uint8_t *)&v, sizeof(v),
-               USB_TIMEOUT) == static_cast<int>(sizeof(v));
+               USB_TIMEOUT);
+    const bool ok = result == static_cast<int>(sizeof(v));
+    if (!ok) {
+      _ctrl_write_failures.fetch_add(1, std::memory_order_relaxed);
+      _logger->error("rtw_write32_wide({:05x}) result={}", addr, result);
+    }
     /* Only a fallback that ALSO failed is a batch write error; a refused
      * async submit that the synchronous path completed is not. */
     if (!ok && _batch_open)
@@ -103,6 +110,9 @@ public:
   void flush_writes() override;
   uint64_t ctrl_xfers() const override {
     return _ctrl_xfers.load(std::memory_order_relaxed);
+  }
+  uint64_t ctrl_write_failures() const override {
+    return _ctrl_write_failures.load(std::memory_order_relaxed);
   }
 
   bool tx_async(uint8_t ep, uint8_t *buf, size_t len,
@@ -213,6 +223,7 @@ private:
    * issued; per instance, so two adapters in one process do not
    * cross-attribute their InitTimer stage counts. */
   std::atomic<uint64_t> _ctrl_xfers{0};
+  std::atomic<uint64_t> _ctrl_write_failures{0};
   bool _tx_no_cancel_multipkt = false; /* DeviceConfig::Tx; tx_sync_data only */
   /* Smallest bulk-OUT wMaxPacketSize, from discover_endpoints: what
    * tx_sync_data's never-cancel rule measures a transfer against
@@ -301,15 +312,27 @@ template <typename T> T UsbTransport::ctrl_read(uint16_t reg_num) {
     _logger->error("rtw_read({:04x}) pipelined failed; reading synchronously",
                    reg_num);
   }
-  _ctrl_xfers.fetch_add(1, std::memory_order_relaxed);
-  if (libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_READ, 5, reg_num,
-                              0, (uint8_t *)&data, sizeof(T),
-                              USB_TIMEOUT) == sizeof(T)) {
-    return data;
+  int result = LIBUSB_ERROR_TIMEOUT;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(USB_TIMEOUT);
+  // One transient read retry shares the original transfer's time budget.
+  for (unsigned attempt = 0; attempt < 2; ++attempt) {
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now()).count();
+    if (remaining <= 0) break;
+    _ctrl_xfers.fetch_add(1, std::memory_order_relaxed);
+    result = libusb_control_transfer(
+        _dev_handle, REALTEK_USB_VENQT_READ, 5, reg_num, 0,
+        (uint8_t *)&data, sizeof(T), static_cast<unsigned>(remaining));
+    if (result == static_cast<int>(sizeof(T))) {
+      if (attempt != 0)
+        _logger->warn("rtw_read({:04x}) recovered after IO error, attempts=2", reg_num);
+      return data;
+    }
+    if (result != LIBUSB_ERROR_IO) break;
   }
-  _logger->error("rtw_read({:04x}), sizeof(T) = {}", reg_num, sizeof(T));
-  throw std::ios_base::failure("rtw_read");
-  return 0;
+  _logger->error("rtw_read({:04x}), sizeof(T) = {}, result={}", reg_num, sizeof(T), result);
+  throw std::ios_base::failure("rtw_read result=" + std::to_string(result));
 }
 
 template <typename T> bool UsbTransport::ctrl_write(uint16_t reg_num, T value) {
@@ -317,10 +340,14 @@ template <typename T> bool UsbTransport::ctrl_write(uint16_t reg_num, T value) {
   if (_batch && async_write(reg_num, 0, &value, sizeof(T)))
     return true;
   _ctrl_xfers.fetch_add(1, std::memory_order_relaxed);
-  const bool ok =
-      libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_WRITE, 5, reg_num,
+  const int result = libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_WRITE, 5, reg_num,
                               0, (uint8_t *)&value, sizeof(T),
-                              USB_TIMEOUT) == sizeof(T);
+                              USB_TIMEOUT);
+  const bool ok = result == static_cast<int>(sizeof(T));
+  if (!ok) {
+    _ctrl_write_failures.fetch_add(1, std::memory_order_relaxed);
+    _logger->error("rtw_write({:04x}) size={} result={}", reg_num, sizeof(T), result);
+  }
   if (!ok && _batch_open)
     _aw->write_errors++; /* the fallback failed too (see write32_wide) */
   return ok;

@@ -1,4 +1,5 @@
 #include "UsbTransport.h"
+// BXI modification 2026-10-15: account for failed synchronous register block writes.
 
 #include <algorithm>
 #include <chrono>
@@ -741,9 +742,15 @@ bool UsbTransport::write_bytes(uint16_t reg_num, const uint8_t *ptr, size_t n) {
    * that downloads firmware this way reports what it actually spent. */
   _ctrl_xfers.fetch_add(1, std::memory_order_relaxed);
   flush_writes();
-  return libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_WRITE, 5,
+  const int result = libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_WRITE, 5,
                                  reg_num, 0, const_cast<uint8_t *>(ptr), n,
-                                 USB_TIMEOUT) == static_cast<int>(n);
+                                 USB_TIMEOUT);
+  if (result != static_cast<int>(n)) {
+    _ctrl_write_failures.fetch_add(1, std::memory_order_relaxed);
+    _logger->error("rtw_write_bytes({:04x}) size={} result={}", reg_num, n, result);
+    return false;
+  }
+  return true;
 }
 
 void UsbTransport::rx_loop(

@@ -1,4 +1,5 @@
 #include "RtlJaguar3Device.h"
+// BXI modification 2026-10-15: reject unconfirmed register writes during retunes.
 #include "TxQueueMap.h"
 #include "PktBufWindow.h"
 #include "InitTimer.h"
@@ -1565,6 +1566,7 @@ void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
   std::lock_guard<std::mutex> ccx(busy_window_mutex());
   busy_window_note_retune();
 
+  const auto write_failures = _device.ctrl_write_failures();
   const bool ch_changed = channel.Channel != _channel.Channel;
   _channel = channel;
   _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
@@ -1599,12 +1601,14 @@ void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
    * the contract robust against future channel-path changes. */
   if (_brought_up && _txpkt_banks.active())
     apply_txpkt_banks_locked();
+  _device.require_control_writes(write_failures);
 }
 
 void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   if (channel == _channel.Channel)
     return; /* no tune, so nothing to spoil — the note goes after this */
+  const auto write_failures = _device.ctrl_write_failures();
   /* A window armed before this retune would integrate across the channel
    * change and report the blend as one channel's occupancy. */
   {
@@ -1631,6 +1635,7 @@ void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
      * every tick regardless.) */
     if (_brought_up && _variant == jaguar3::ChipVariant::C8822E)
       _hal.configure_tssi(channel);
+    _device.require_control_writes(write_failures);
     return;
   }
   /* Fast path declined (band change / never tuned) — full channel set at the
@@ -1642,6 +1647,7 @@ void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
   reapply_8822e_5g_path(channel);
   if (_brought_up && _variant == jaguar3::ChipVariant::C8822E)
     _hal.configure_tssi(channel);
+  _device.require_control_writes(write_failures);
 }
 
 void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {

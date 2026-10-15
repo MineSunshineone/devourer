@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// BXI modification 2026-10-15: cover bounded reads and reject failed channel writes.
 #include "UsbTransport.h"
+#ifdef DEVOURER_HAVE_JAGUAR3_8822E
+#include "jaguar3/RtlJaguar3Device.h"
+#endif
 
 #include <atomic>
 #include <barrier>
@@ -9,6 +13,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 namespace {
 std::atomic<int> calls{0};
@@ -18,6 +23,16 @@ int failures = 0;
 libusb_transfer *pending = nullptr;
 unsigned async_calls = 0;
 bool parallel_probe = false;
+bool override_control_read = false;
+int control_read_result = 0;
+int second_control_read_result = 0;
+unsigned control_read_calls = 0;
+bool exhaust_control_budget = false;
+bool emulate_registers = false;
+std::unordered_map<uint32_t, unsigned char> registers;
+uint32_t failed_register = 0xffffffffu;
+unsigned failed_register_writes = 0;
+int failed_register_result = LIBUSB_ERROR_IO;
 int probe_active = 0, probe_peak = 0, probe_entered = 0;
 std::mutex probe_mutex;
 std::condition_variable probe_ready;
@@ -89,6 +104,92 @@ void endpoint_scenario(bool same_endpoint) {
   CHECK(probe_peak == (same_endpoint ? 1 : 2));
   CHECK(!transport.tx_stats().needs_reinit);
 }
+
+void read_scenario(int first, int second, bool exhaust_budget = false) {
+  auto logger = std::make_shared<Logger>();
+  logger->set_level(Logger::Level::Silent);
+  devourer::UsbTransport transport(reinterpret_cast<libusb_device_handle *>(1), logger);
+  override_control_read = true;
+  control_read_result = first;
+  second_control_read_result = second;
+  control_read_calls = 0;
+  exhaust_control_budget = exhaust_budget;
+  const unsigned expected_calls = first == LIBUSB_ERROR_IO && !exhaust_budget ? 2 : 1;
+  const int result = expected_calls == 2 ? second : first;
+  const auto before = transport.ctrl_xfers();
+  try {
+    CHECK(transport.read32(0x0cbc) == 0);
+    CHECK(result == 4);
+  } catch (const std::ios_base::failure& error) {
+    CHECK(result != 4);
+    CHECK(std::string(error.what()).find("result=" + std::to_string(result)) != std::string::npos);
+  }
+  CHECK(transport.ctrl_xfers() == before + expected_calls);
+  CHECK(control_read_calls == expected_calls);
+  override_control_read = false;
+  exhaust_control_budget = false;
+}
+
+#ifdef DEVOURER_HAVE_JAGUAR3_8822E
+void retune_write_failure(bool fast, uint32_t reg, int failure = LIBUSB_ERROR_IO) {
+  auto logger = std::make_shared<Logger>();
+  logger->set_level(Logger::Level::Silent);
+  auto transport = std::make_shared<devourer::UsbTransport>(
+      reinterpret_cast<libusb_device_handle *>(1), logger);
+  RtlJaguar3Device radio(RtlAdapter(transport, logger), logger,
+                         jaguar3::ChipVariant::C8822E);
+  emulate_registers = true;
+  registers.clear();
+  radio.SetMonitorChannel({.Channel = 153, .ChannelOffset = 0,
+                           .ChannelWidth = CHANNEL_WIDTH_20});
+  failed_register = reg;
+  failed_register_result = failure;
+  failed_register_writes = 0;
+  bool rejected = false;
+  try {
+    if (fast) radio.FastRetune(165, true);
+    else radio.SetMonitorChannel({.Channel = 165, .ChannelOffset = 0,
+                                  .ChannelWidth = CHANNEL_WIDTH_20});
+  } catch (const std::exception& error) {
+    rejected = std::string(error.what()).find("radio register write failed") != std::string::npos;
+  }
+  CHECK(failed_register_writes != 0);
+  CHECK(rejected);
+  failed_register = 0xffffffffu;
+  radio.SetMonitorChannel({.Channel = 157, .ChannelOffset = 0,
+                           .ChannelWidth = CHANNEL_WIDTH_20});
+  CHECK(registers[0x3c60] == 157 && registers[0x4c60] == 157);
+  emulate_registers = false;
+}
+#endif
+
+void control_write_failure_accounting() {
+  auto logger = std::make_shared<Logger>();
+  logger->set_level(Logger::Level::Silent);
+  devourer::UsbTransport transport(reinterpret_cast<libusb_device_handle *>(1), logger);
+  for (const int failure : {static_cast<int>(LIBUSB_ERROR_IO), 0}) {
+    for (unsigned operation = 0; operation < 5; ++operation) {
+      const auto write = [&] {
+        const unsigned char bytes[]{1, 2, 3, 4};
+        switch (operation) {
+          case 0: return transport.write8(0xc30, 1);
+          case 1: return transport.write16(0xc30, 1);
+          case 2: return transport.write32(0xc30, 1);
+          case 3: return transport.write32_wide(0x10c30, 1);
+          default: return transport.write_bytes(0xc30, bytes, sizeof(bytes));
+        }
+      };
+      failed_register = operation == 3 ? 0x10c30u : 0xc30u;
+      failed_register_result = failure;
+      const auto before = transport.ctrl_write_failures();
+      CHECK(!write());
+      CHECK(transport.ctrl_write_failures() == before + 1);
+      failed_register = 0xffffffffu;
+      CHECK(write());
+      CHECK(transport.ctrl_write_failures() == before + 1);
+    }
+  }
+}
 }  // namespace
 
 // Exercise the real UsbTransport; replace only its libusb device I/O.
@@ -113,9 +214,26 @@ extern "C" int LIBUSB_CALL libusb_handle_events_timeout_completed(
   return 0;
 }
 extern "C" int LIBUSB_CALL libusb_control_transfer(
-    libusb_device_handle *, uint8_t, uint8_t, uint16_t, uint16_t,
+    libusb_device_handle *, uint8_t type, uint8_t, uint16_t reg, uint16_t index,
     unsigned char *data, uint16_t length, unsigned) {
+  const uint32_t address = reg | (static_cast<uint32_t>(index) << 16);
+  if (type == 0x40) {
+    if (address == failed_register) {
+      ++failed_register_writes;
+      return failed_register_result;
+    }
+    if (emulate_registers)
+      for (unsigned i = 0; i < length; ++i) registers[address + i] = data[i];
+    return length;
+  }
   std::memset(data, 0, length);
+  if (type == 0xc0 && override_control_read) {
+    ++control_read_calls;
+    if (exhaust_control_budget) std::this_thread::sleep_for(std::chrono::milliseconds(510));
+    return control_read_calls == 1 ? control_read_result : second_control_read_result;
+  }
+  if (emulate_registers)
+    for (unsigned i = 0; i < length; ++i) data[i] = registers[address + i];
   return length;
 }
 extern "C" int LIBUSB_CALL libusb_submit_transfer(libusb_transfer *transfer) {
@@ -180,6 +298,20 @@ void async_scenario(libusb_transfer_status status, int actual, bool poisoned) {
 }
 
 int main() {
+  for (const auto result : std::array<int, 6>{LIBUSB_ERROR_IO, LIBUSB_ERROR_TIMEOUT,
+                                           LIBUSB_ERROR_NO_DEVICE, 0, 2, 4})
+    read_scenario(result, result);
+  read_scenario(LIBUSB_ERROR_IO, 4);
+  read_scenario(LIBUSB_ERROR_IO, LIBUSB_ERROR_NO_DEVICE);
+  read_scenario(LIBUSB_ERROR_TIMEOUT, 4);
+  read_scenario(LIBUSB_ERROR_IO, 4, true);
+  control_write_failure_accounting();
+#ifdef DEVOURER_HAVE_JAGUAR3_8822E
+  for (const bool fast : {false, true})
+    for (const auto reg : {0x3c60u, 0x4c60u, 0xc30u})
+      retune_write_failure(fast, reg);
+  retune_write_failure(true, 0x3c60u, 0);
+#endif
   endpoint_scenario(false);
   endpoint_scenario(true);
   scenario(LIBUSB_ERROR_IO, 512, true);

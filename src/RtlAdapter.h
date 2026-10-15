@@ -1,5 +1,6 @@
 #ifndef RTLADAPTER_H
 #define RTLADAPTER_H
+// BXI modification 2026-10-15: reject retunes with failed register writes.
 
 /* RtlAdapter — the bus-neutral register/frame accessor every HAL component
  * holds BY VALUE (a copyable value type; every copy shares the one transport
@@ -20,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 
 #ifdef _WIN32
 /* The hal headers below lean on Windows types (BOOLEAN/VOID in rtw_efuse.h)
@@ -95,6 +97,11 @@ public:
   bool write_batch_end() { return _transport->write_batch_end(); }
   void flush_writes() { _transport->flush_writes(); }
   uint64_t ctrl_xfers() const { return _transport->ctrl_xfers(); }
+  uint64_t ctrl_write_failures() const { return _transport->ctrl_write_failures(); }
+  void require_control_writes(uint64_t before) const {
+    if (ctrl_write_failures() != before)
+      throw std::runtime_error("radio register write failed; reinitialization required");
+  }
 
   /* Kernel-style async RX: keep n_urbs concurrent bulk-IN transfers in flight
    * (USB) or reap the RX buffer-descriptor ring (PCIe), invoking

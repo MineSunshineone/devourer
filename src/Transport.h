@@ -1,4 +1,5 @@
 #pragma once
+// BXI modification 2026-10-15: expose failed synchronous register writes for checked retunes.
 
 /* ITransport — the bus seam. USB (libusb) and PCIe (vfio) are independent
  * transports implementing this one interface; RtlAdapter (the copyable value
@@ -91,6 +92,8 @@ public:
    * per stage. Per instance, never process-wide. 0 where the notion does
    * not apply (PCIe MMIO). */
   virtual uint64_t ctrl_xfers() const { return 0; }
+  // Pipelined bring-up writes report their failures through write_batch_end.
+  virtual uint64_t ctrl_write_failures() const { return 0; }
 
   /* ---- frame plane ---- */
   /* Fire-and-forget data TX (the send_packet hot path). `ep` is the USB

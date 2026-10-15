@@ -1,4 +1,5 @@
 #include "RtlKestrelDevice.h"
+// BXI modification 2026-10-16: check retune writes and synchronize dynamic ACK lifecycle.
 
 #include <chrono>
 #include <thread>
@@ -508,10 +509,12 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
 
 void RtlKestrelDevice::SetMonitorChannel(SelectedChannel channel) {
   std::lock_guard ccx(busy_window_mutex());
+  const auto write_failures = _device.ctrl_write_failures();
   if (!cancel_channel_busy_locked(devourer::BusySpoil::Retuned))
     throw std::runtime_error("Kestrel: CCX restore failed before retune");
   _channel = channel;
   _hal.set_channel(channel.Channel, channel.ChannelWidth, channel.ChannelOffset, channel.Band);
+  _device.require_control_writes(write_failures);
 }
 
 void RtlKestrelDevice::SetCcaMode(bool disabled) {
@@ -810,9 +813,11 @@ void RtlKestrelDevice::FastRetune(uint8_t channel, bool /*cache_rf*/) {
     return;
   }
   std::lock_guard ccx(busy_window_mutex());
+  const auto write_failures = _device.ctrl_write_failures();
   if (!cancel_channel_busy_locked(devourer::BusySpoil::Retuned))
     throw std::runtime_error("Kestrel: CCX restore failed before fast retune");
   _hal.fast_retune(channel);
+  _device.require_control_writes(write_failures);
   _channel.Channel = channel;
 }
 
@@ -898,6 +903,7 @@ bool RtlKestrelDevice::ConfigureAckPeer(const devourer::MacAddr &local,
   if (!_hal.register_ba_peer_sta(local.bytes.data(), peer.bytes.data(),
                                  /*macid=*/1, /*addr_cam_idx=*/1))
     return false;
+  if (!SetAckResponder(local)) return false;
   _cfg.rx.ack_responder = local;
   _cfg.rx.ack_peer = peer;
   return true;
@@ -905,6 +911,12 @@ bool RtlKestrelDevice::ConfigureAckPeer(const devourer::MacAddr &local,
 
 void RtlKestrelDevice::ClearAckPeer() {
   std::lock_guard lock(_tx_packet_mutex);
+  ClearAckResponder();
+  {
+    std::lock_guard ack_lock(_ack_mutex);
+    if (_ack_responder)
+      throw std::runtime_error("Kestrel ACK responder clear unconfirmed");
+  }
   if (_ba_cam_armed) {
     if (!_hal.configure_ba_responder(_ampdu.tid, false))
       throw std::runtime_error("Kestrel BA peer clear failed");
