@@ -20,6 +20,7 @@
 #include "RadioManagementJaguar3.h"
 #include "PhydmRuntimeJaguar3.h"
 #include "TxPktPwrBanks.h"
+#include "VhtSounding.h"
 
 /* RtlJaguar3Device is the orchestrator for the Realtek "Jaguar3" 802.11ac family
  * — RTL8822CU, RTL8812EU, RTL8822EU. It is the Jaguar3 sibling of
@@ -61,7 +62,7 @@ public:
                                 const devourer::MacAddr& peer,
                                 bool beamformer) override;
   void ClearBeamformingPeer() override;
-  void PollBeamforming(uint64_t max_feedback_age_ms) override;
+  void PollBeamforming(uint64_t max_feedback_age_ms, bool allow_apply = true) override;
   void ClearBeamforming() override;
   devourer::BeamformingStatus GetBeamformingStatus() override;
   void SetMonitorChannel(SelectedChannel channel) override;
@@ -464,6 +465,11 @@ private:
   bool _bf_mapping_saved = false;
   std::atomic<uint32_t> _bf_report_control{0};
   uint64_t _bf_hw_mismatches = 0;
+  devourer::bf::FeedbackChange _bf_change;
+  std::atomic<bool> _bf_change_valid{false};
+  std::atomic<uint16_t> _bf_change_x1000{0};
+  std::atomic<uint64_t> _bf_control_reads{0}, _bf_control_total_us{0}, _bf_control_max_us{0};
+  std::atomic<uint64_t> _bf_register_busy_skips{0};
   /* dis_cca sticky state, one field per gate — re-applied after
    * SetMonitorChannel (the channel set rewrites the BB CCA registers) and
    * handed to phydm as edcca_track. Both false is the default. Caller holds

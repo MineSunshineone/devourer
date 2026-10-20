@@ -453,6 +453,9 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
                   _rx_bw_code.load(), _bf_dialog.load(), p.RxAtrib.fcs_present) &&
               devourer::bf::feedback_fresh(devourer::beamforming_now_ms(),
                   _bf_pending_ms.load(), 150) && _bf_pending.exchange(false)) {
+            const auto change = _bf_change.observe({f.frame, f.frame_len}, p.RxAtrib.fcs_present);
+            _bf_change_valid.store(change.has_value());
+            _bf_change_x1000.store(change.value_or(0));
             _bf_cbr_count.fetch_add(1);
             _bf_feedback_ms.store(devourer::beamforming_now_ms());
             _bf_report_control.store(static_cast<uint32_t>(f.frame[26]) |
@@ -2499,15 +2502,38 @@ bool RtlJaguar3Device::SendBeamformingSounding(uint8_t token) {
   return sent;
 }
 
-void RtlJaguar3Device::PollBeamforming(uint64_t max_feedback_age_ms) {
+void RtlJaguar3Device::PollBeamforming(uint64_t max_feedback_age_ms, bool allow_apply) {
   if (!_bf_txbf_armed) return;
-  std::lock_guard<std::mutex> lk(_reg_mu);
+  const bool was_fresh = devourer::bf::feedback_fresh(
+      devourer::beamforming_now_ms(), _bf_feedback_ms.load(), max_feedback_age_ms);
+  if (!devourer::bf::poll_required(was_fresh, _bf_apply_on.load(),
+                                  _bf_apply_requested.load(), allow_apply)) return;
+  std::unique_lock<std::mutex> lk(_reg_mu, std::defer_lock);
+  if (was_fresh) {
+    if (!lk.try_lock()) { ++_bf_register_busy_skips; return; }
+  } else lk.lock(); // Expired active weights must be retired before another data frame.
   const auto last = _bf_feedback_ms.load();
   const bool fresh = devourer::bf::feedback_fresh(
       devourer::beamforming_now_ms(), last, max_feedback_age_ms);
-  if (fresh && !_bf_apply_requested.load()) return;
+  if (!devourer::bf::poll_required(fresh, _bf_apply_on.load(),
+                                  _bf_apply_requested.load(), allow_apply)) return;
   // RX_CSI_RPT_INFO[24:1] must match each new report, including while active.
-  const auto hardware = fresh ? _device.rtw_read32(0x071c) : 0;
+  uint32_t hardware = 0;
+  if (fresh) {
+    const auto started = std::chrono::steady_clock::now();
+    ++_bf_control_reads;
+    try { hardware = _device.rtw_read32(0x071c); }
+    catch (const std::exception& error) {
+      _logger->error("Jaguar3 BF: CSI read failed after {} us: {}",
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - started).count(), error.what());
+      throw;
+    }
+    const auto elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count());
+    _bf_control_total_us.fetch_add(elapsed);
+    _bf_control_max_us.store(std::max(_bf_control_max_us.load(), elapsed));
+  }
   const auto expected = _bf_report_control.load();
   if (!fresh || ((hardware >> 1) & 0xffffffu) != expected) {
     if (fresh && ++_bf_hw_mismatches <= 3)
@@ -2537,6 +2563,8 @@ void RtlJaguar3Device::ClearBeamforming() {
 }
 
 void RtlJaguar3Device::clear_beamforming_locked() {
+  _bf_change.reset();
+  _bf_change_valid.store(false);
   _bf_pending.store(false);
   _bf_pending_ms.store(0);
   _bf_feedback_ms.store(0);
@@ -2563,7 +2591,10 @@ devourer::BeamformingStatus RtlJaguar3Device::GetBeamformingStatus() {
   return {.active = _bf_apply_on.load(),
           .feedback_reports = _bf_cbr_count.load(),
           .rejected_reports = _bf_rejected_count.load(),
-          .feedback_age_ms = last ? devourer::beamforming_now_ms() - last : 0};
+          .feedback_age_ms = last ? devourer::beamforming_now_ms() - last : 0,
+          .change_valid = _bf_change_valid.load(), .change_x1000 = _bf_change_x1000.load(),
+          .control_reads = _bf_control_reads.load(), .control_total_us = _bf_control_total_us.load(),
+          .control_max_us = _bf_control_max_us.load(), .register_busy_skips = _bf_register_busy_skips.load()};
 }
 
 bool RtlJaguar3Device::send_built_block(uint8_t *block, size_t len) {

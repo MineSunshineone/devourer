@@ -428,7 +428,8 @@ public:
   // Poll at least once per max_feedback_age_ms to retire stale CSI.
   virtual bool SendBeamformingSounding(uint8_t /*token*/) { return false; }
   // Call from the TX/control owner, never from a USB receive callback.
-  virtual void PollBeamforming(uint64_t /*max_feedback_age_ms*/) {}
+  // allow_apply=false only retires expired CSI; it never reads a fresh CSI register.
+  virtual void PollBeamforming(uint64_t /*max_feedback_age_ms*/, bool /*allow_apply*/ = true) {}
   virtual void ClearBeamforming() {}
   virtual devourer::BeamformingStatus GetBeamformingStatus() { return {}; }
 

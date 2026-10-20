@@ -4,6 +4,7 @@
 #include "BfReportDecode.h"
 #include <array>
 #include <cstring>
+#include <optional>
 #include <span>
 
 namespace devourer::bf {
@@ -20,6 +21,50 @@ inline bool valid_peer(const uint8_t self[6], const uint8_t peer[6]) {
 inline bool feedback_fresh(uint64_t now, uint64_t received, uint64_t max_age) {
   return received != 0 && now >= received && now - received <= max_age;
 }
+
+inline bool poll_required(bool fresh, bool active, bool requested, bool allow_apply) {
+  return fresh ? allow_apply && requested : active;
+}
+
+// Compare validated 2-TX SU steering directions, excluding SNR and dialog token.
+class FeedbackChange {
+public:
+  void reset() { _phi.clear(); _psi.clear(); _format = 0; }
+
+  std::optional<uint16_t> observe(std::span<const uint8_t> frame, bool fcs_present) {
+    if (frame.size() < 30) return std::nullopt;
+    const unsigned nc = (frame[26] & 7) + 1, nr = ((frame[26] >> 3) & 7) + 1;
+    const unsigned bw = frame[26] >> 6, ng = frame[27] & 3;
+    if (nr != 2 || nc > 2 || bw > 2 || ng == 3 || (frame[27] & 0x78))
+      return std::nullopt;
+    const int bpsi = frame[27] & 4 ? 4 : 2, bphi = bpsi + 2;
+    const int ns = report_ns(bw, 1 << ng);
+    const size_t bytes = (ns * (bphi + bpsi) + 7) / 8;
+    if (frame.size() != 29 + nc + bytes + (fcs_present ? 4 : 0))
+      return std::nullopt;
+    ReportHdr hdr;
+    hdr.nr = nr; hdr.nc = nc; hdr.ns = ns;
+    hdr.angles = frame.data() + 29 + nc; hdr.angle_len = bytes;
+    if (!decode_angles(hdr, bphi, bpsi, &_next_phi, &_next_psi)) return std::nullopt;
+    const unsigned format = frame[26] | ((frame[27] & 7u) << 8);
+    std::optional<uint16_t> result;
+    if (_format == format && _phi.size() == _next_phi.size()) {
+      double change = 0;
+      for (size_t i = 0; i < _phi.size(); ++i) {
+        const double a = std::cos(_psi[i]) * std::cos(_next_psi[i]);
+        const double b = std::sin(_psi[i]) * std::sin(_next_psi[i]);
+        const double correlation = a*a + b*b + 2*a*b*std::cos(_phi[i] - _next_phi[i]);
+        change += std::clamp(1.0 - correlation, 0.0, 1.0);
+      }
+      result = static_cast<uint16_t>(std::lround(change * 1000 / _phi.size()));
+    }
+    _phi.swap(_next_phi); _psi.swap(_next_psi); _format = format;
+    return result;
+  }
+private:
+  unsigned _format = 0;
+  std::vector<double> _phi, _psi, _next_phi, _next_psi;
+};
 
 // Single unassociated SU peer, AID 0, one feedback column (IEEE VHT NDPA).
 inline std::array<uint8_t, 19> vht_ndpa(const uint8_t self[6],

@@ -9,6 +9,12 @@
 
 int main() {
   const uint8_t self[6]{2, 1, 2, 3, 4, 5}, peer[6]{2, 6, 7, 8, 9, 10};
+  assert(!devourer::bf::poll_required(true, true, false, true));
+  assert(!devourer::bf::poll_required(true, true, true, false));
+  assert(!devourer::bf::poll_required(false, false, true, true));
+  assert(devourer::bf::poll_required(true, false, true, true));
+  assert(devourer::bf::poll_required(false, true, false, false));
+  assert(devourer::bf::poll_required(false, true, true, true));
   const uint8_t zero[6]{}, multicast[6]{3, 1, 2, 3, 4, 5};
   assert(devourer::bf::valid_peer(self, peer));
   assert(!devourer::bf::valid_peer(self, self));
@@ -36,6 +42,40 @@ int main() {
     return devourer::bf::valid_vht_feedback(frame, self, peer, 0, 1);
   };
   assert(valid(feedback));
+  for (unsigned bw = 0; bw < 3; ++bw) for (unsigned ng = 0; ng < 3; ++ng)
+    for (bool codebook : {false, true}) {
+      const unsigned bpsi = codebook ? 4 : 2, bphi = bpsi + 2;
+      const auto report = [&](unsigned phi, unsigned psi) {
+        auto frame = feedback;
+        const unsigned tones = devourer::bf::report_ns(bw, 1 << ng);
+        frame.resize(30 + (tones * (bphi + bpsi) + 7) / 8 + 4);
+        frame[26] = static_cast<uint8_t>((bw << 6) | 8);
+        frame[27] = static_cast<uint8_t>(ng | (codebook ? 4 : 0));
+        std::fill(frame.begin() + 30, frame.end(), 0);
+        unsigned bit = 0;
+        const auto put = [&](unsigned value, unsigned count) {
+          for (unsigned i = 0; i < count; ++i, ++bit)
+            frame[30 + bit / 8] |= ((value >> i) & 1u) << (bit % 8);
+        };
+        for (unsigned i = 0; i < tones; ++i) { put(phi, bphi); put(psi, bpsi); }
+        return frame;
+      };
+      const auto first = report(0, (1u << (bpsi - 1)) - 1);
+      devourer::bf::FeedbackChange change;
+      assert(!change.observe(first, true));
+      assert(change.observe(first, true) == 0);
+      auto token_only = first; token_only[28] = 8; token_only[29] = 255;
+      assert(change.observe(token_only, true) == 0);
+      const auto opposite = report(1u << (bphi - 1), (1u << (bpsi - 1)) - 1);
+      assert(change.observe(opposite, true).value() >= 800);
+      change.reset();
+      assert(!change.observe(first, true));
+      const auto wrap = report((1u << bphi) - 1, (1u << (bpsi - 1)) - 1);
+      assert(change.observe(wrap, true).value() <= (codebook ? 10 : 40));
+      assert(!change.observe(std::span(first).first(29), true));
+      auto stripped = wrap; stripped.resize(stripped.size() - 4);
+      assert(change.observe(stripped, false) == 0);
+    }
   assert(!devourer::bf::is_vht_ndpa(feedback));
   for (const auto& [offset, value] : {
            std::pair{0, 0x88}, {1, 4}, {4, 3}, {10, 3}, {22, 1}, {24, 7}, {25, 1},
