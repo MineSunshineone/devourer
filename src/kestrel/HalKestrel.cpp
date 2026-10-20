@@ -2286,7 +2286,8 @@ void HalKestrel::vnd_bb_set_gain(uint8_t channel, uint8_t band_type) {
 void HalKestrel::vnd_bb_ctrl_tx_path() {
   if (_halbb_ctx && _variant == ChipVariant::C8852C) {
     kestrel_halbb_ctrl_tx_path(_halbb_ctx);
-    _logger->info("Kestrel PHY: T-MAC TX path-com routed (vendored, 8852C)");
+    _logger->info("Kestrel PHY: T-MAC TX path-com routed (vendored, 8852C), "
+                  "TX path enable/map from P-MAC (A+B)");
   }
 }
 
@@ -2300,23 +2301,38 @@ void HalKestrel::vnd_bb_ctrl_bw_ch(uint8_t pri_ch, uint8_t center,
                 : bw == CHANNEL_WIDTH_10 ? 7
                                          : static_cast<uint8_t>(bw);
   kestrel_halbb_ctrl_bw_ch(_halbb_ctx, pri_ch, center, hbw, band_type);
-  /* 6 GHz: with the BB table's EDCCA level the MAC EDCCA gate latches busy
-   * (measured: 1/300 delivered vs 300/300 with that one gate cleared, both
-   * buses, both 8852CE cards and the 8852CU) because the receiver's own
-   * floor as the BB measures it (-67..-69 dBm, every radio, every band)
-   * sits inside the default's hysteresis band. Program the vendor's
-   * unlinked EDCCA_NORMAL_MODE level (never busy) there; 2.4/5 GHz keep the
-   * table default the carrier-sense TX measurement was taken with. The
-   * report line is the per-band evidence (pwdB = the BB's energy reading). */
-  if (band_type == 2)
-    kestrel_halbb_edcca_6g(_halbb_ctx, hbw);
+  /* 5 and 6 GHz: with the BB table's EDCCA level the MAC EDCCA gate latches
+   * busy because the receiver's own floor as the BB measures it (-65..-69
+   * dBm, every radio; no DIG runs here) sits inside the default's hysteresis
+   * band. 6 GHz: 1/300 delivered vs 300/300 with that one gate cleared (both
+   * buses, both 8852CE cards and the 8852CU). 5 GHz, 8832CU, 8812CU witness,
+   * 20 ms gap: ch6/36/44 ~50% witnessed, ch52 52%, ch60 21%, ch64 3%,
+   * ch100/149/157/161 0 of ~435 with 0.0% SDR airtime and the injector
+   * stalling on bulk-OUT timeouts; clearing the EDCCA gate alone restores
+   * ch64-161 to the ch6 rate, clearing the primary gate alone restores
+   * nothing. Program the vendor's unlinked EDCCA_NORMAL_MODE level (never
+   * busy) on both bands — the vendor's own level for an unassociated device;
+   * preamble carrier sense stays on and still defers (ch161 after the change,
+   * max-duty 6M injector, 8 s: 19063 frames sent on a quiet channel; under a
+   * co-channel max-duty MCS1 flood 7327 sent / 7086 witnessed with the gates
+   * on vs 15676 / 10639 with DEVOURER_DIS_CCA=1). 2.4 GHz
+   * keeps the table default the carrier-sense TX measurement was taken with
+   * (its floor reads -82 dBm, busy=0). The report line is the per-band
+   * evidence (pwdB = the BB's energy reading). */
+  bool restored = false;
+  if (band_type == 2 || band_type == 1)
+    kestrel_halbb_edcca_park(_halbb_ctx, band_type, hbw);
+  else
+    restored = kestrel_halbb_edcca_restore(_halbb_ctx, hbw) != 0;
   delay_us(5000);
   int rpt[8] = {0};
   kestrel_halbb_edcca_report(_halbb_ctx, rpt);
-  _logger->info("Kestrel PHY: EDCCA band{} pwdB fb={} p20={} path0={} busy={}{}",
-                band_type, rpt[0], rpt[1], rpt[6], rpt[3],
-                band_type == 2 ? " (6 GHz: energy-detect parked at the vendor's "
-                                 "unlinked level; preamble CCA stays on)"
+  _logger->info("Kestrel PHY: EDCCA band{} level={} pwdB fb={} p20={} path0={} busy={}{}",
+                band_type, kestrel_halbb_edcca_level(_halbb_ctx), rpt[0], rpt[1],
+                rpt[6], rpt[3],
+                band_type != 0 ? " (5/6 GHz: energy-detect parked at the vendor's "
+                                  "unlinked level; preamble CCA stays on)"
+                : restored     ? " (2.4 GHz: table level restored after a parked band)"
                                : "");
 }
 
@@ -2537,15 +2553,19 @@ void HalKestrel::fast_retune(uint8_t channel) {
 
 void HalKestrel::fast_set_bw(ChannelWidth_t bw) {
   /* Lean 20 <-> 5/10 MHz toggle (same channel). Only the BB small-BW field
-   * (0x49C4[13:12]) + ACI-detect (0x4738/0x4AA4[16]) differ between 20 MHz and
-   * narrowband; RF_BW stays 0 and RF18[11:10] stays "both" for all of 20/5/10,
-   * so no RF re-tune or gain re-apply is needed. */
+   * ([13:12], per-die address below) + ACI-detect (0x4738/0x4AA4[16])
+   * differ between 20 MHz and narrowband; RF_BW stays 0 and RF18[11:10]
+   * stays "both" for all of 20/5/10, so no RF re-tune or gain re-apply is
+   * needed. */
   const uint32_t smallbw = bw == CHANNEL_WIDTH_5    ? 0x1
                            : bw == CHANNEL_WIDTH_10 ? 0x2
                                                     : 0x0;      /* 20 MHz */
   const uint32_t aci = bw == CHANNEL_WIDTH_20 ? 0x1 : 0x0;      /* off for NB */
-  bb_rmw(0x49C0, 0xC0000000u, 0x0); /* RF_BW = 0 */
-  bb_rmw(0x49C4, 0x3000u, smallbw);
+  /* RF_BW and small-BW sit at 0x4974/0x4978 on the 8852C and 0x49C0/0x49C4 on
+   * the 8852B (halbb_ctrl_bw_8852{c,b}); the ACI bits are shared. */
+  const bool c = _variant == ChipVariant::C8852C;
+  bb_rmw(c ? 0x4974 : 0x49C0, 0xC0000000u, 0x0); /* RF_BW = 0 */
+  bb_rmw(c ? 0x4978 : 0x49C4, 0x3000u, smallbw);
   bb_rmw(0x4738, 0x10000u, aci);
   bb_rmw(0x4AA4, 0x10000u, aci);
   bb_reset_all();
@@ -2600,6 +2620,121 @@ void HalKestrel::bb_reset_all() {
   bb_rmw(0xc3c, 1u << 9, 0);
 }
 
+namespace {
+/* rtw89_phy_get_txsc: which sub-channel of a `cbw` channel a `dbw`-wide PPDU
+ * airs on, from the primary channel number vs the block center. 0 when the
+ * PPDU is as wide as the channel. */
+uint8_t phy_get_txsc(uint8_t pri, uint8_t center, ChannelWidth_t cbw,
+                     ChannelWidth_t dbw) {
+  if (cbw == dbw || cbw == CHANNEL_WIDTH_20)
+    return 0;
+  const bool above = pri > center;
+  const uint8_t idx20 = static_cast<uint8_t>(
+      above ? (pri - center) >> 1 : ((center - pri) >> 1) + 1);
+  switch (cbw) {
+  case CHANNEL_WIDTH_40:
+    return above ? 1 : 2;
+  case CHANNEL_WIDTH_80:
+    return dbw == CHANNEL_WIDTH_20 ? idx20 : (above ? 9 : 10);
+  case CHANNEL_WIDTH_160:
+    if (dbw == CHANNEL_WIDTH_20)
+      return idx20;
+    if (dbw == CHANNEL_WIDTH_40) {
+      if (idx20 == 1 || idx20 == 3)
+        return 9;
+      if (idx20 == 5 || idx20 == 7)
+        return 11;
+      if (idx20 == 2 || idx20 == 4)
+        return 10;
+      if (idx20 == 6 || idx20 == 8)
+        return 12;
+      return 0xff;
+    }
+    return above ? 13 : 14;
+  default:
+    return 0;
+  }
+}
+} /* namespace */
+
+void HalKestrel::mac_set_bw_txsc(uint8_t channel, uint8_t center,
+                                 ChannelWidth_t bw) {
+  /* The MAC side of a tune, as rtw89 rtw8852c_set_channel_mac does it:
+   * R_AX_WMAC_RFMOD carries the channel width, and R_AX_TX_SUB_CARRIER_VALUE
+   * the sub-channel each narrower PPDU airs on. Left at its cmac_com_init
+   * zeros, a 20 MHz frame on an 80 MHz channel airs at the block center,
+   * where nothing listening on the primary hears it. */
+  uint8_t rfmod = 0;
+  uint32_t txsc = 0;
+  const auto field = [](uint8_t v, uint8_t sh) {
+    return (uint32_t{v} & r::B_AX_TXSC_MSK) << sh;
+  };
+  switch (bw) {
+  case CHANNEL_WIDTH_160:
+    rfmod = 3;
+    txsc = field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_20),
+                 r::B_AX_TXSC_20M_SH) |
+           field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_40),
+                 r::B_AX_TXSC_40M_SH) |
+           field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_80),
+                 r::B_AX_TXSC_80M_SH);
+    break;
+  case CHANNEL_WIDTH_80:
+    rfmod = 2;
+    txsc = field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_20),
+                 r::B_AX_TXSC_20M_SH) |
+           field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_40),
+                 r::B_AX_TXSC_40M_SH);
+    break;
+  case CHANNEL_WIDTH_40:
+    rfmod = 1;
+    txsc = field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_20),
+                 r::B_AX_TXSC_20M_SH);
+    break;
+  default: /* 20 MHz and the 5/10 MHz small-BW modes: RF in 20 MHz mode */
+    break;
+  }
+  const uint8_t m = _device.rtw_read8(r::R_AX_WMAC_RFMOD);
+  _device.rtw_write8(r::R_AX_WMAC_RFMOD,
+                     static_cast<uint8_t>((m & ~r::B_AX_WMAC_RFMOD_MSK) | rfmod));
+  _device.rtw_write32(r::R_AX_TX_SUB_CARRIER_VALUE, txsc);
+  if (rfmod)
+    _logger->info("Kestrel set_channel: pri {} center {} rfmod {} txsc 0x{:03x}",
+                  channel, center, rfmod, txsc);
+}
+
+void HalKestrel::fast_set_primary_80(uint8_t channel, uint8_t center) {
+  /* Move the primary 20 inside the 80 MHz block the RF already sits on: the
+   * pieces of halbb_ctrl_bw_ch_8852{b,c} that read pri_ch at 80 MHz -- the
+   * [11:8] sub-band index and the 5 MHz edge mask (halbb_5m_mask_8852{b,c})
+   * -- and the MAC TXSC, then a BB reset. No RF tune, no IQK: the ~210 ms of
+   * the full path. Same steps on both dies, at the registers each one's
+   * halbb uses; the mask's 0x3f field is 0x4 on both (the 8852D's 0x5 is not
+   * handled). */
+  const bool c = _variant == ChipVariant::C8852C;
+  const uint32_t pri_reg = c ? 0x4978 : 0x49C4;
+  const uint32_t mask_regs[2] = {c ? 0x4c4cu : 0x46f8u, c ? 0x4d10u : 0x47b8u};
+  const uint32_t mask_en_reg = c ? 0x4450 : 0x4440;
+  const uint32_t mask_en_bit = c ? 1u << 24 : 1u << 31;
+  const int d = int(channel) - int(center);
+  const uint8_t idx = static_cast<uint8_t>(d > 0 ? d / 2 : -d / 2 + 1);
+  bb_rmw(pri_reg, 0xf00, idx);
+  const bool mask_en = idx == 3 || idx == 4, mask_low = idx == 4;
+  for (const uint32_t a : mask_regs) {
+    if (mask_en) {
+      bb_rmw(a, 0x3f, 0x4);
+      bb_rmw(a, 1u << 12, 1);
+      bb_rmw(a, 1u << 8, mask_low ? 0 : 1);
+      bb_rmw(a, 1u << 6, mask_low ? 1 : 0);
+    } else {
+      bb_rmw(a, 1u << 12, 0);
+    }
+  }
+  bb_rmw(mask_en_reg, mask_en_bit, mask_en ? 1 : 0);
+  mac_set_bw_txsc(channel, center, CHANNEL_WIDTH_80);
+  bb_reset_all();
+}
+
 bool HalKestrel::set_channel(uint8_t channel, ChannelWidth_t bw,
                              uint8_t offset, uint8_t band) {
   /* band: 0 = auto (2.4 GHz if ch<=14 else 5 GHz), 6 = 6 GHz. band_type is the
@@ -2651,6 +2786,7 @@ bool HalKestrel::set_channel(uint8_t channel, ChannelWidth_t bw,
                     "MHz for 6 GHz TX.");
   }
 
+  mac_set_bw_txsc(channel, center, bw);
 
   if (_variant == ChipVariant::C8852C) {
     /* DIG PD lower-bound disable (halbb_dig_init_io_en -> dyn_pd_th, set_en=0):
