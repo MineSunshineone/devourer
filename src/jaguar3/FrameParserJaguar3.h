@@ -69,6 +69,8 @@ constexpr size_t RXDESC_SIZE_8822C = 24; /* RX_DESC_SIZE_88XX */
 #define SET_TX_DESC_TXPWR_OFSET_TYPE_8822C(d, v) SET_BITS_TO_LE_4BYTE((d) + 0x14, 28, 2, v)
 #define SET_TX_DESC_DISQSELSEQ_8822C(d, v) SET_BITS_TO_LE_4BYTE((d) + 0x00, 31, 1, v)
 #define SET_TX_DESC_G_ID_8822C(d, v)       SET_BITS_TO_LE_4BYTE((d) + 0x08, 24, 6, v)
+#define SET_TX_DESC_P_AID_8822C(d, v)      SET_BITS_TO_LE_4BYTE((d) + 0x08, 0, 9, v)
+#define SET_TX_DESC_MU_DATARATE_8822C(d, v) SET_BITS_TO_LE_4BYTE((d) + 0x28, 8, 8, v)
 /* Per-frame TX-status report request (halmac SPE_RPT): the fw answers this
  * frame's transmission with a CCX C2H report (src/TxReport.h). */
 #define SET_TX_DESC_SPE_RPT_8822C(d, v)    SET_BITS_TO_LE_4BYTE((d) + 0x08, 19, 1, v)
@@ -147,7 +149,8 @@ inline void fill_data_tx_desc_8822c(uint8_t *d, uint16_t pkt_size,
                                     uint8_t data_sc = 0,
                                     uint8_t pwr_ofset_type = 0,
                                     uint8_t pkt_offset = 0,
-                                    bool dis_data_fb = false) {
+                                    bool dis_data_fb = false,
+                                    bool su_txbf = false) {
   SET_TX_DESC_TXPKTSIZE_8822C(d, pkt_size);
   SET_TX_DESC_OFFSET_8822C(d, static_cast<uint32_t>(TXDESC_SIZE_8822C));
   SET_TX_DESC_LS_8822C(d, 1);
@@ -162,6 +165,7 @@ inline void fill_data_tx_desc_8822c(uint8_t *d, uint16_t pkt_size,
    * throughput (the chip already airs a saturating MCS7 flood at ~77% duty with
    * or without them) — they are here for a faithful port, not a fix. */
   SET_TX_DESC_DISQSELSEQ_8822C(d, 1);
+  // Keep the SU-to-peer group used by injection, including steered frames.
   SET_TX_DESC_G_ID_8822C(d, 0x3f);
   SET_TX_DESC_RTY_LMT_EN_8822C(d, 1);
   SET_TX_DESC_RTS_DATA_RTY_LMT_8822C(d, 12);
@@ -183,6 +187,8 @@ inline void fill_data_tx_desc_8822c(uint8_t *d, uint16_t pkt_size,
   SET_TX_DESC_DISDATAFB_8822C(d, dis_data_fb ? 1 : 0);
   SET_TX_DESC_SW_DEFINE_8822C(d, 1);
   SET_TX_DESC_DATARATE_8822C(d, rate_hw);
+  // rtl8822e_fill_txdesc_bf writes this companion rate even for SU traffic.
+  if (su_txbf) SET_TX_DESC_MU_DATARATE_8822C(d, rate_hw);
   SET_TX_DESC_DATA_BW_8822C(d, bw);
   /* Data sub-channel: which 20/40 MHz slice of a wider configured channel the
    * frame occupies (VHT_DATA_SC_*). 0 = DONT_CARE (frame BW == channel BW). Set
@@ -190,7 +196,8 @@ inline void fill_data_tx_desc_8822c(uint8_t *d, uint16_t pkt_size,
   SET_TX_DESC_DATA_SC_8822C(d, data_sc);
   SET_TX_DESC_DATA_SHORT_8822C(d, short_gi ? 1 : 0);
   SET_TX_DESC_DATA_LDPC_8822C(d, ldpc ? 1 : 0);
-  SET_TX_DESC_DATA_STBC_8822C(d, stbc & 0x3);
+  // Vendor rtl8822e_fill_txdesc_bf disables STBC for steered data.
+  SET_TX_DESC_DATA_STBC_8822C(d, su_txbf ? 0 : (stbc & 0x3));
   /* Per-packet power-offset bank (0 = baseline, byte-identical to the prior
    * descriptor). Inside the checksummed span (0x14) — before the checksum. */
   if (pwr_ofset_type)
@@ -210,6 +217,8 @@ inline void fill_data_tx_desc_8822c(uint8_t *d, uint16_t pkt_size,
    * stamp, not broadcast, use-header NAV, no rate fallback. */
   if (ndpa) {
     SET_TX_DESC_NDPA_8822C(d, 1);
+    // This injection path is unassociated; the IBSS MACID rule does not apply.
+    SET_TX_DESC_P_AID_8822C(d, 0);
     SET_TX_DESC_EN_HWSEQ_8822C(d, 0);
     SET_TX_DESC_BMC_8822C(d, 0);
     SET_TX_DESC_NAVUSEHDR_8822C(d, 1);
@@ -316,6 +325,7 @@ inline PhyStsFill parse_phy_sts_jgr3(const uint8_t *physts, uint16_t physts_len,
   const uint8_t f7 = physts[7];
   a.ldpc = (f7 >> 5) & 1;
   a.stbc = (f7 >> 6) & 1;
+  a.beamformed = (f7 >> 7) & 1;
   /* RX bandwidth from the active rxsc: legacy OFDM uses l_rxsc, HT/VHT uses
    * ht_rxsc; rxsc 1-8 = 20, 9-12 = 40, >=13 = 80 MHz (phydm_rxsc_2_bw).
    * phydm_rxsc_2_bw: RXSC 0 means the packet occupied the receiver's full

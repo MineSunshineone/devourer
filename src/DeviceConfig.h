@@ -348,11 +348,10 @@ struct DeviceConfig {
     bool mu = false;
     /* env: DEVOURER_BF_TXBF=<mac> — Jaguar3: configure the beamformer entry
      * for closed-loop TX-beamforming apply toward this peer (the apply itself
-     * gates on the first CBR seen by the RX loop; needs rx.enable_with_tx). */
+     * gates in PollBeamforming on fresh validated CSI; needs rx.enable_with_tx). */
     std::optional<MacAddr> txbf_peer;
     /* env: DEVOURER_TX_NDPA — 0 = off; 1 = mark every injected frame NDPA
-     * (self-sounding capture); N>1 = every Nth frame (Jaguar3 periodic
-     * re-sounding; Jaguar1/2 treat any nonzero as on). */
+     * (self-sounding capture); N>1 = every Nth frame (legacy probe; Jaguar3 TXBF instead requires an actual NDPA frame). */
     int ndpa_period = 0;
   } bf;
 

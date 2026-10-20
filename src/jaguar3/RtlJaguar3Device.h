@@ -2,6 +2,7 @@
 #define RTL_JAGUAR3_DEVICE_H
 
 #include <atomic>
+#include <array>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -55,6 +56,10 @@ public:
     return static_cast<uint8_t>(_tx_rpt_tag.load(std::memory_order_relaxed) & 0xff);
   }
   void StopRxLoop() override { _rx_stop = true; }
+  bool SendBeamformingSounding(uint8_t token) override;
+  void PollBeamforming(uint64_t max_feedback_age_ms) override;
+  void ClearBeamforming() override;
+  devourer::BeamformingStatus GetBeamformingStatus() override;
   void SetMonitorChannel(SelectedChannel channel) override;
   /* Lean frequency-hop retune (Jaguar3 port of the Jaguar1 FastRetune — see
    * docs/frequency-hopping.md): the RF18 channel write inside its 3-wire
@@ -267,6 +272,9 @@ public:
   bool should_stop = false;
 
 private:
+  void arm_beamformee();
+  void set_bf_data_mapping(bool enabled);
+  void clear_beamforming_locked();
   /* This generation's CCX map and register access, under its locks — see
    * IRtlRadio::with_ccx. Private: the base class calls it, nobody else. */
   bool with_ccx(const CcxFn &fn) override {
@@ -432,13 +440,24 @@ private:
   /* Frame counter for periodic NDPA sounding (DEVOURER_TX_NDPA=N). */
   uint64_t _ndpa_ctr = 0;
   /* TX beamforming apply state (DEVOURER_BF_TXBF). The entry is configured at
-   * InitWrite (arm_beamformer_entry); the apply toggle is enabled from the RX
-   * loop only after a Compressed Beamforming Report from _bf_peer is ingested
+   * InitWrite (arm_beamformer_entry); the control owner enables apply only
+   * after a fresh, complete peer CBR matches the hardware CSI control field
    * (blind apply degrades). */
-  bool _bf_txbf_armed = false;
+  std::atomic<bool> _bf_txbf_armed{false};
   std::atomic<bool> _bf_apply_on{false};
   std::atomic<uint64_t> _bf_cbr_count{0};
+  std::atomic<uint64_t> _bf_rejected_count{0};
+  std::atomic<uint64_t> _bf_feedback_ms{0};
+  std::atomic<uint8_t> _bf_dialog{1};
+  std::atomic<bool> _bf_pending{false};
+  std::atomic<uint64_t> _bf_pending_ms{0};
+  std::atomic<bool> _bf_apply_requested{false};
   uint8_t _bf_peer[6] = {0};
+  uint8_t _bf_self[6] = {0};
+  std::array<uint32_t, 4> _bf_normal_mapping{}, _bf_steered_mapping{};
+  bool _bf_mapping_saved = false;
+  std::atomic<uint32_t> _bf_report_control{0};
+  uint64_t _bf_hw_mismatches = 0;
   /* dis_cca sticky state, one field per gate — re-applied after
    * SetMonitorChannel (the channel set rewrites the BB CCA registers) and
    * handed to phydm as edcca_track. Both false is the default. Caller holds
