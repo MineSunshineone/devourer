@@ -20,10 +20,22 @@ bfbench txon 30 1 101
 
 The bench is fixed to channel 153 / 20 MHz, VHT1SS MCS7 / LDPC / SGI,
 1100-byte payloads, local sender MAC `02:42:58:49:00:11`, and receiver
-`02:42:58:49:00:12`. Both TX arms use the same calibrated -20 dB offset;
+`02:42:58:49:00:12`. Both TX arms request the same -24 qdB offset and require a non-saturated
+hardware readback. This is a nominal index-based offset, not measured RF dB;
 no flat TXAGC override is used. These identities are specific to this bench.
 The chip's calibration and both receive chains remain intact. No USB reset is
 issued. Restore the original RF58/link services after the experiment.
+
+Data uses QoS TID 0 with the destination as BSSID, matching the production
+ACK/aggregation path. Paced batches reuse `send_packets` and its existing
+three-frame USB aggregation. `BF_USB` records time spent sending and hard
+submission failures; a failed partial URB is not counted as fully submitted.
+
+For a control-read comparison, `txread` keeps BF off but reads the same CSI
+register at 10 Hz. `BF_PHY` separates ordinary/BF PHY samples by run ID and
+only counts full decoded pages for SNR/EVM. Values are raw sums: divide the
+SNR/EVM sums by `full_n` and then 2 for dB, following the vendor PHY format.
+Per-path SNR is not the post-equalizer EVM and neither establishes range.
 
 Both TX arms sound every 100 ms with a real 19-byte VHT NDPA and a hardware
 2-stream NDP. `txoff` receives CSI but never applies it. `txon` calls

@@ -309,13 +309,14 @@ inline bool parse_rx_8822c(const uint8_t *buf, size_t buflen,
  * must not fold a field the return value does not claim. */
 inline PhyStsFill parse_phy_sts_jgr3(const uint8_t *physts, uint16_t physts_len,
                                      uint8_t configured_bw, rx_pkt_attrib &a) {
+  a.phy_fill = PhyStsFill::None;
   if (physts == nullptr || physts_len < 28)
     return PhyStsFill::None;
   const uint8_t page_num = physts[0] & 0x0f;
   if (page_num == 0) {
     /* type0 (CCK): DW0 = page_num(0), pwdb_a(1). Single path-A power. */
     a.rssi[0] = physts[1];
-    return PhyStsFill::Power;
+    return a.phy_fill = PhyStsFill::Power;
   }
   /* OFDM header (valid for every jgr3 OFDM page): per-path pwdb[4] at bytes
    * 1..4, DW1 byte5 l_rxsc[3:0]/ht_rxsc[7:4], DW1 byte7 flags. */
@@ -346,7 +347,7 @@ inline PhyStsFill parse_phy_sts_jgr3(const uint8_t *physts, uint16_t physts_len,
       a.evm[i] = static_cast<int8_t>(physts[16 + i]);
       a.snr[i] = static_cast<int8_t>(physts[24 + i]);
     }
-    return PhyStsFill::Full;
+    return a.phy_fill = PhyStsFill::Full;
   }
   /* Pages 2..6: the common header above was parsed and is valid, so this is a
    * Power fill rather than a failure — reporting None here would throw away
@@ -354,7 +355,7 @@ inline PhyStsFill parse_phy_sts_jgr3(const uint8_t *physts, uint16_t physts_len,
    * if the BB page selector ever left type1 (devourer's BB table pins
    * 0x8C0[25:22]=1, but the vendor auto-switch and debug page helpers do not
    * restore it). */
-  return PhyStsFill::Power;
+  return a.phy_fill = PhyStsFill::Power;
 }
 
 } /* namespace jaguar3 */

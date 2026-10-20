@@ -88,8 +88,13 @@ int main() {
   rx_pkt_attrib attr{};
   attr.data_rate = 0x33;
   assert(jaguar3::parse_phy_sts_jgr3(phy, sizeof(phy), 0, attr) == PhyStsFill::Full);
-  assert(attr.beamformed && attr.ldpc && !attr.stbc);
+  assert(attr.beamformed && attr.ldpc && !attr.stbc && attr.phy_fill == PhyStsFill::Full);
   phy[7] = 0;
   jaguar3::parse_phy_sts_jgr3(phy, sizeof(phy), 0, attr);
   assert(!attr.beamformed);
+  phy[0] = 2;
+  assert(jaguar3::parse_phy_sts_jgr3(phy, sizeof(phy), 0, attr) == PhyStsFill::Power);
+  assert(attr.phy_fill == PhyStsFill::Power);
+  jaguar3::parse_phy_sts_jgr3(nullptr, 0, 0, attr);
+  assert(attr.phy_fill == PhyStsFill::None);
 }
