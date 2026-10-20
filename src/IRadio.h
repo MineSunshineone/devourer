@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <mutex>
 #include "Sounding.h"
+#include "BeamformingStatus.h"
 #include "TriggerTwt.h"
 #include "TxCaps.h"
 #include "TxMode.h"
@@ -416,6 +417,20 @@ public:
   virtual bool StartSounding(const devourer::SoundingConfig & /*cfg*/) {
     return false;
   }
+
+  // Explicit SU sounding; unsupported backends refuse without touching hardware.
+  // Single-peer SU BF: invoke from the TX/control owner only.
+  // Replaces the old peer and invalidates its CSI; false means unsupported.
+  virtual bool ConfigureBeamformingPeer(const devourer::MacAddr& /*self*/,
+                                       const devourer::MacAddr& /*peer*/,
+                                       bool /*beamformer*/) { return false; }
+  virtual void ClearBeamformingPeer() {}
+  // Poll at least once per max_feedback_age_ms to retire stale CSI.
+  virtual bool SendBeamformingSounding(uint8_t /*token*/) { return false; }
+  // Call from the TX/control owner, never from a USB receive callback.
+  virtual void PollBeamforming(uint64_t /*max_feedback_age_ms*/) {}
+  virtual void ClearBeamforming() {}
+  virtual devourer::BeamformingStatus GetBeamformingStatus() { return {}; }
 
   /* Batch TX: submit `count` frames (each buffer = radiotap header + 802.11
    * MPDU, the send_packet contract) in one call. With USB TX aggregation

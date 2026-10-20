@@ -46,6 +46,7 @@ struct rx_pkt_attrib
      * notably on all-but-one subframe of an A-MPDU. Never set on Kestrel, whose
      * PHY status arrives as its own PPDU-status frame rather than in drvinfo. */
     bool physt;
+    PhyStsFill phy_fill = PhyStsFill::None; // Decoded signal fields; Jaguar3 currently populates this.
     uint8_t drvinfo_sz;
     uint8_t shift_sz;
     bool qos;
@@ -74,6 +75,7 @@ struct rx_pkt_attrib
     uint8_t stbc;
     uint8_t ldpc;
     uint8_t sgi;
+    bool beamformed = false;
     /* Descrambler seed the chip recovered from this frame's SERVICE field.
      * Trustworthy only on RTL8814AU (see FrameParser.cpp); surfaced for the
      * DEVOURER_DUMP_SCRAMBLER hook in examples/rx/main.cpp. */

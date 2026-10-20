@@ -1715,6 +1715,18 @@ target_link_libraries(BfReportDecodeSelftest PRIVATE devourer)
 
 add_test(NAME bf_report_decode COMMAND BfReportDecodeSelftest)
 
+add_executable(VhtSoundingSelftest tests/vht_sounding_selftest.cpp)
+target_link_libraries(VhtSoundingSelftest PRIVATE devourer)
+add_test(NAME vht_sounding COMMAND VhtSoundingSelftest)
+
+# Isolated SU TxBF bench; never enabled by normal transport configuration.
+if(DEVOURER_JAGUAR3)
+    add_executable(bfbench examples/bfbench/main.cpp
+        examples/common/env_config.cpp examples/common/usb_select.cpp)
+    target_link_libraries(bfbench PRIVATE devourer PkgConfig::libusb)
+    target_include_directories(bfbench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+endif()
+
 # Headless guards for the adaptive-channel-migration data model (src/chanmig/):
 # ChannelDef grid legality + the scan-plan grammar; the pure dwell scheduler
 # (coverage, revisit priority, starvation, round advancement); and the
