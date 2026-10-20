@@ -1679,6 +1679,7 @@ void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   if (bw == _channel.ChannelWidth)
     return; /* no reconfiguration, so nothing to spoil */
+  const auto write_failures = _device.ctrl_write_failures();
   clear_beamforming_locked();
   /* A bandwidth change reconfigures the front end, so a window armed before
    * it was measuring a different receiver — the same argument as a retune,
@@ -1698,7 +1699,8 @@ void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
     _channel.ChannelWidth = bw;
     _rx_bw_code.store(channel_width_to_bw_code(bw), std::memory_order_relaxed);
     apply_igi_floor_locked(_channel.Channel, bw);
-    reapply_8822e_5g_path(_channel.Channel);
+    // Clock-only switching preserves RF/RFE routing; replaying it also overwrites narrowband shaping.
+    _device.require_control_writes(write_failures);
     return;
   }
   /* Fast path declined (40/80 endpoint, cold radio) — full channel set, under
@@ -1709,6 +1711,7 @@ void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
   _rx_bw_code.store(channel_width_to_bw_code(bw), std::memory_order_relaxed);
   reapply_8822e_5g_path(_channel.Channel);
   apply_igi_floor_locked(_channel.Channel, bw);
+  _device.require_control_writes(write_failures);
 }
 
 void RtlJaguar3Device::apply_igi_floor_locked(uint8_t channel,
