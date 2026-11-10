@@ -2504,6 +2504,14 @@ void HalKestrel::set_txpwr_dbm(int16_t dbm_q2) {
 }
 
 void HalKestrel::fast_retune(uint8_t channel) {
+  if (_variant == ChipVariant::C8852B && _fw.ch12_ready()) {
+    _fw.with_tx_paused([&] { fast_retune_unpaused(channel); });
+  } else {
+    fast_retune_unpaused(channel);
+  }
+}
+
+void HalKestrel::fast_retune_unpaused(uint8_t channel) {
   /* Lean same-band, 20 MHz retune: only the RF synth channel changes. Re-apply
    * the band-specific gain/RPL (the 5 GHz sub-band may shift, e.g. 5G-L->5G-H)
    * and the fixed TX power, then a BB reset — but skip the BB bandwidth config

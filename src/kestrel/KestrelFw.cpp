@@ -730,6 +730,65 @@ bool KestrelFw::reg_write_ofld(const OfldWrite *cmds, size_t n) {
   throw std::runtime_error("Kestrel IO-offload: firmware reply timeout");
 }
 
+void KestrelFw::set_scheduler_tx_enabled(uint16_t enabled) {
+  // 8852B cmac_tx.c hw_sch_tx_en / fwcmd.c proc_msg_reg: firmware owns
+  // CTN_TXEN after initialization. Use its command and completion handshake.
+  std::lock_guard<std::mutex> reply_lock(_ofld_mu);
+  constexpr uint16_t h2c_data = 0x8140, h2c_control = 0x8160;
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::microseconds(r::CMD_OFLD_POLL_CNT * r::CMD_OFLD_POLL_US);
+  const auto wait_trigger = [&](uint16_t address, bool set) {
+    do {
+      if (bool(_device.rtw_read8(address) & 1) == set) return;
+      std::this_thread::sleep_for(std::chrono::microseconds(r::CMD_OFLD_POLL_US));
+    } while (std::chrono::steady_clock::now() < deadline);
+    throw std::runtime_error("Kestrel scheduler: firmware handshake timeout");
+  };
+  wait_trigger(h2c_control, false);
+  if (_device.rtw_read8(r::R_AX_C2HREG_CTRL) & r::B_AX_C2HREG_TRIGGER)
+    throw std::runtime_error("Kestrel scheduler: unconsumed firmware reply");
+  // Function5; content8B + header2B rounded to3dwords. Full16-bit mask, band0.
+  if (!_device.rtw_write32(h2c_data, (uint32_t(enabled) << 16) | 0x305) ||
+      !_device.rtw_write32(h2c_data + 4, 0xffff) ||
+      !_device.rtw_write32(h2c_data + 8, 0) ||
+      !_device.rtw_write32(h2c_data + 12, 0) ||
+      !_device.rtw_write8(h2c_control, _device.rtw_read8(h2c_control) | 1))
+    throw std::runtime_error("Kestrel scheduler: command write failed");
+  wait_trigger(r::R_AX_C2HREG_CTRL, true);
+  const auto reply = _device.rtw_read32(r::R_AX_C2HREG_DATA0);
+  (void)_device.rtw_read32(r::R_AX_C2HREG_DATA1);
+  (void)_device.rtw_read32(r::R_AX_C2HREG_DATA2);
+  (void)_device.rtw_read32(r::R_AX_C2HREG_DATA3);
+  const auto control = _device.rtw_read8(r::R_AX_C2HREG_CTRL);
+  if (!_device.rtw_write8(r::R_AX_C2HREG_CTRL, control & ~r::B_AX_C2HREG_TRIGGER))
+    throw std::runtime_error("Kestrel scheduler: reply acknowledgement failed");
+  if ((reply & 0x7f) != 4 || ((reply >> 8) & 0xf) < 1 ||
+      ((reply >> 8) & 0xf) > 4 ||
+      _device.rtw_read16(r::R_AX_CTN_TXEN) != enabled)
+    throw std::runtime_error("Kestrel scheduler: pause/restore was not confirmed");
+}
+
+void KestrelFw::with_tx_paused(const std::function<void()>& operation) {
+  const auto saved = _device.rtw_read16(r::R_AX_CTN_TXEN);
+  try {
+    set_scheduler_tx_enabled(0);
+    // Vendor band_idle_ck: PTCL_TX_ON_STAT must clear before resetting the BB.
+    constexpr uint16_t tx_status = 0xc6ec;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::microseconds(2200 * 30);
+    while (_device.rtw_read8(tx_status) & 0x80) {
+      if (std::chrono::steady_clock::now() >= deadline)
+        throw std::runtime_error("Kestrel scheduler: MAC TX did not become idle");
+      std::this_thread::sleep_for(std::chrono::microseconds(30));
+    }
+    operation();
+  } catch (...) {
+    set_scheduler_tx_enabled(saved);
+    throw;
+  }
+  set_scheduler_tx_enabled(saved);
+}
+
 bool KestrelFw::send_h2c_cmd(uint8_t cat, uint8_t h2c_class, uint8_t func,
                              const uint8_t *content, uint32_t len) {
   /* Serialize: this mutates the shared _txbuf scratch + the _h2c_seq counter and

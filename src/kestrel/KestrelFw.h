@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -179,7 +180,12 @@ public:
   };
   bool reg_write_ofld(const OfldWrite *cmds, size_t n);
 
+  // Caller owns the radio's tuning lock. Restore the exact previous queue mask
+  // after the operation, including failures; a failed restore requires reinit.
+  void with_tx_paused(const std::function<void()>& operation);
+
 private:
+  void set_scheduler_tx_enabled(uint16_t enabled);
   /* Generic H2C over CH12: [WD 24B][fwcmd_hdr 8B][content]. */
   bool send_h2c_cmd(uint8_t cat, uint8_t h2c_class, uint8_t func,
                     const uint8_t *content, uint32_t len);

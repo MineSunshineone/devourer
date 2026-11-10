@@ -616,6 +616,7 @@ public:
   ChipVariant variant() const { return _variant; }
 
 private:
+  void fast_retune_unpaused(uint8_t channel);
   /* Read-modify-write helpers on 32/16/8-bit registers. */
   void set32(uint16_t reg, uint32_t bits);
   void clr32(uint16_t reg, uint32_t bits);

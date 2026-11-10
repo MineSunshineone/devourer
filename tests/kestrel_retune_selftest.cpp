@@ -12,6 +12,7 @@ class Registers final : public devourer::ITransport {
  public:
   std::map<uint32_t, uint32_t> values;
   unsigned writes = 0, reads = 0, sends = 0;
+  unsigned scheduler_commands = 0;
   uint64_t failed_writes = 0;
   bool fail_writes = false;
   uint64_t ctrl_write_failures() const override { return failed_writes; }
@@ -30,6 +31,15 @@ class Registers final : public devourer::ITransport {
     ++writes;
     if (fail_writes) { ++failed_writes; return false; }
     values[a] = v;
+    if (a == 0x8160 && (v & 1)) {
+      CHECK((values[0x8140] & 0xffff) == 0x305);
+      CHECK(values[0x8144] == 0xffff);
+      values[0xc348] = values[0x8140] >> 16;
+      values[0x8150] = 0x104;
+      values[0x8164] = 1;
+      values[0x8160] = v & ~1u;
+      ++scheduler_commands;
+    }
     return true;
   }
   bool write_bytes(uint16_t, const uint8_t *, size_t) override {
@@ -52,6 +62,7 @@ void check_retune(kestrel::ChipVariant variant) {
   RtlKestrelDevice radio(adapter, logger, variant);
   radio.SetMonitorChannel({.Channel = 9, .ChannelOffset = 0,
                            .ChannelWidth = CHANNEL_WIDTH_20});
+  regs->values[0xc348] = 0x9a5b;
   regs->clear_counts();
   radio.FastRetune(9);
   CHECK(regs->reads == 0 && regs->writes == 0 && regs->sends == 0);
@@ -60,6 +71,8 @@ void check_retune(kestrel::ChipVariant variant) {
   radio.FastRetune(10);
   CHECK(regs->writes > 0 || regs->sends > 0);
   CHECK(radio.GetSelectedChannel().Channel == 10);
+  CHECK(regs->values[0xc348] == 0x9a5b);
+  CHECK(regs->scheduler_commands == (variant == kestrel::ChipVariant::C8852B ? 2u : 0u));
   regs->clear_counts();
   radio.FastRetune(10);
   CHECK(regs->reads == 0 && regs->writes == 0 && regs->sends == 0);
