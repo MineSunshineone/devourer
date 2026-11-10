@@ -1384,6 +1384,10 @@ if(DEVOURER_KESTREL)
     target_link_libraries(KestrelPeerSelftest PRIVATE devourer)
     add_test(NAME kestrel_peer COMMAND KestrelPeerSelftest)
 
+    add_executable(KestrelRetuneSelftest tests/kestrel_retune_selftest.cpp)
+    target_link_libraries(KestrelRetuneSelftest PRIVATE devourer)
+    add_test(NAME kestrel_retune COMMAND KestrelRetuneSelftest)
+
     # Golden-bytes guard for the trigger-UL + TWT H2C content encoders
     # (src/kestrel/SchedEncode.h): each config's emitted LE dwords vs the
     # hand-computed vendor SET_WORD layout (F2P v0/v1, TWT, UL_FIXINFO).

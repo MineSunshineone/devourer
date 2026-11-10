@@ -842,7 +842,10 @@ void RtlKestrelDevice::FastRetune(uint8_t channel, bool /*cache_rf*/) {
   const auto write_failures = _device.ctrl_write_failures();
   if (!cancel_channel_busy_locked(devourer::BusySpoil::Retuned))
     throw std::runtime_error("Kestrel: CCX restore failed before fast retune");
-  _hal.fast_retune(channel);
+  // Same-channel surveys still finish any CCX window, but do not reset the BB
+  // or submit another RF retune to firmware merely to restore the current tune.
+  if (channel != _channel.Channel)
+    _hal.fast_retune(channel);
   _device.require_control_writes(write_failures);
   _channel.Channel = channel;
 }
