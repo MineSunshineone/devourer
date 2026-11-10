@@ -1388,6 +1388,10 @@ if(DEVOURER_KESTREL)
     target_link_libraries(KestrelRetuneSelftest PRIVATE devourer)
     add_test(NAME kestrel_retune COMMAND KestrelRetuneSelftest)
 
+    add_executable(KestrelOffloadSelftest tests/kestrel_offload_selftest.cpp)
+    target_link_libraries(KestrelOffloadSelftest PRIVATE devourer)
+    add_test(NAME kestrel_offload COMMAND KestrelOffloadSelftest)
+
     add_executable(KestrelUsbAggregateSelftest tests/kestrel_usb_aggregate_selftest.cpp)
     target_compile_features(KestrelUsbAggregateSelftest PRIVATE cxx_std_20)
     target_include_directories(KestrelUsbAggregateSelftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

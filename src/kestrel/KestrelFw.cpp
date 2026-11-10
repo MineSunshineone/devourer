@@ -2,6 +2,9 @@
 #include "KestrelAddrCam.h"
 
 #include <cstring>
+#include <chrono>
+#include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include "KestrelLe.h"
@@ -670,6 +673,9 @@ bool KestrelFw::reg_write_ofld(const OfldWrite *cmds, size_t n) {
    * dword3 = mask. type is fixed WRITE (masked RMW on-chip). */
   if (n == 0 || n > 0x7f)
     return false;
+  std::lock_guard<std::mutex> reply_lock(_ofld_mu);
+  if (_device.rtw_read8(r::R_AX_C2HREG_CTRL) & r::B_AX_C2HREG_TRIGGER)
+    throw std::runtime_error("Kestrel IO-offload: unconsumed firmware reply");
   std::vector<uint8_t> buf(n * 16, 0);
   for (size_t i = 0; i < n; i++) {
     const OfldWrite &c = cmds[i];
@@ -689,9 +695,39 @@ bool KestrelFw::reg_write_ofld(const OfldWrite *cmds, size_t n) {
     put_le32(buf.data() + i * 16 + 8, c.value);
     put_le32(buf.data() + i * 16 + 12, c.mask);
   }
-  return send_h2c_cmd(r::FWCMD_H2C_CAT_MAC, r::FWCMD_H2C_CL_FW_OFLD,
-                      r::FWCMD_H2C_FUNC_CMD_OFLD_REG, buf.data(),
-                      static_cast<uint32_t>(buf.size()));
+  if (!send_h2c_cmd(r::FWCMD_H2C_CAT_MAC, r::FWCMD_H2C_CL_FW_OFLD,
+                    r::FWCMD_H2C_FUNC_CMD_OFLD_REG, buf.data(),
+                    static_cast<uint32_t>(buf.size())))
+    throw std::runtime_error("Kestrel IO-offload: command submission failed");
+
+  // fwofld.c chk_cmd_ofld_reg: USB completion only means the command arrived.
+  // Consume the entire firmware result and acknowledge its mailbox before
+  // another batch or scheduler command can use it.
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::microseconds(r::CMD_OFLD_POLL_CNT * r::CMD_OFLD_POLL_US);
+  do {
+    if (_device.rtw_read8(r::R_AX_C2HREG_CTRL) & r::B_AX_C2HREG_TRIGGER) {
+      const uint32_t result = _device.rtw_read32(r::R_AX_C2HREG_DATA0);
+      const uint32_t offset = _device.rtw_read32(r::R_AX_C2HREG_DATA1);
+      const uint32_t expected = _device.rtw_read32(r::R_AX_C2HREG_DATA2);
+      const uint32_t actual = _device.rtw_read32(r::R_AX_C2HREG_DATA3);
+      const auto control = _device.rtw_read8(r::R_AX_C2HREG_CTRL);
+      if (!_device.rtw_write8(r::R_AX_C2HREG_CTRL,
+                              control & ~r::B_AX_C2HREG_TRIGGER))
+        throw std::runtime_error("Kestrel IO-offload: reply acknowledgement failed");
+      if ((result & 0x7f) != r::FWCMD_C2HREG_FUNC_IO_OFLD_RESULT ||
+          ((result >> 8) & 0xf) != 4)
+        throw std::runtime_error("Kestrel IO-offload: invalid firmware reply");
+      if ((result >> 16) & 0xff) {
+        _logger->error("Kestrel IO-offload failed: result=0x{:08x} offset=0x{:08x} expected=0x{:08x} actual=0x{:08x}",
+                       result, offset, expected, actual);
+        throw std::runtime_error("Kestrel IO-offload: firmware rejected command");
+      }
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(r::CMD_OFLD_POLL_US));
+  } while (std::chrono::steady_clock::now() < deadline);
+  throw std::runtime_error("Kestrel IO-offload: firmware reply timeout");
 }
 
 bool KestrelFw::send_h2c_cmd(uint8_t cat, uint8_t h2c_class, uint8_t func,

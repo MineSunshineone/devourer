@@ -167,7 +167,8 @@ public:
    * masked write; src selects the target space (RF a-die/d-die, BB, MAC), path
    * the RF chain. The last command carries the LC (list-complete) bit. Used by
    * the FastRetune hot path to collapse the per-hop RF18/0xcf write burst.
-   * Fire-and-forget: the C2H IO_OFLD_RESULT is not awaited (write-only batch).*/
+   * Waits for and acknowledges C2H IO_OFLD_RESULT before returning. A failed
+   * or uncertain firmware result throws so callers cannot retune over it. */
   struct OfldWrite {
     uint8_t src;      /* RTW_MAC_{RF=1, RF_DDIE=3, BB=0, MAC=2}_CMD_OFLD */
     uint8_t path;     /* RF path (0=A, 1=B); 0 for BB/MAC */
@@ -225,6 +226,8 @@ private:
    * RX/C2H thread while the control thread issues another) would otherwise
    * corrupt the scratch buffer and desync the sequence. */
   std::mutex _h2c_mu;
+  // Own the register-mailbox reply until it has been consumed and acknowledged.
+  std::mutex _ofld_mu;
   bool _is_sec_ic = false; /* OTP 0x5ED[7]: gates the non-secure FWDL patch */
 };
 
