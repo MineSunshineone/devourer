@@ -1716,11 +1716,15 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
       _tx_usb_agg_ep = ep;
     else if (ep != _tx_usb_agg_ep)
       return false;
-    const size_t aligned = (tx_buf.size() + 7u) & ~size_t{7u};
-    const size_t old_size = _tx_usb_agg_buf.size();
-    _tx_usb_agg_buf.resize(old_size + aligned, 0);
-    std::memcpy(_tx_usb_agg_buf.data() + old_size, tx_buf.data(),
-                tx_buf.size());
+    const size_t bulk_packet_size = _device.speed() >= devourer::kUsbSpeedSuper
+                                        ? 1024u
+                                        : (_device.speed() == devourer::kUsbSpeedHigh ? 512u : 64u);
+    if (!kestrel::append_usb_tx_frame(_tx_usb_agg_buf, tx_buf,
+                                     wd_len + kestrel::WD_INFO_LEN,
+                                     bulk_packet_size)) {
+      _tx_usb_agg_full = true;
+      return false;
+    }
     ++_tx_usb_agg_count;
     return true;
   }
@@ -1763,16 +1767,22 @@ size_t RtlKestrelDevice::send_packets(const TxPacketView *pkts,
     else if (qsel != first_qsel) return IRadio::send_packets(pkts, count);
   }
   size_t total_accepted = 0;
-  for (size_t begin = 0; begin < count; begin += max_frames) {
+  for (size_t begin = 0; begin < count;) {
     const size_t end = std::min(count, begin + max_frames);
     _tx_usb_agg_active = true;
+    _tx_usb_agg_full = false;
     _tx_usb_agg_ep = 0;
     _tx_usb_agg_count = 0;
     _tx_usb_agg_buf.clear();
     size_t accepted = 0;
-    for (size_t i = begin; i < end; ++i)
+    size_t i = begin;
+    for (; i < end; ++i) {
       if (send_packet(pkts[i].data, pkts[i].len))
         ++accepted;
+      else if (_tx_usb_agg_full)
+        break; // Flush the current batch, then retry this unconsumed frame.
+    }
+    begin = i;
     _tx_usb_agg_active = false;
     if (accepted == 0) {
       _tx_usb_agg_buf.clear();

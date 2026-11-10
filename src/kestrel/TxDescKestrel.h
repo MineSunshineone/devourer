@@ -96,6 +96,22 @@ constexpr uint32_t WD_BODY_LEN_V1 = 32; /* wd_body_t_v1 (8852C data/mgmt TX) */
 constexpr uint32_t WD_INFO_LEN = 24;
 constexpr uint32_t TXD_MGNT_LEN = WD_BODY_LEN + WD_INFO_LEN; /* 48 */
 
+inline bool append_usb_tx_frame(std::vector<uint8_t> &aggregate,
+                                const std::vector<uint8_t> &frame,
+                                size_t descriptor_length,
+                                size_t bulk_packet_size) {
+  // Vendor RTW_WKARD_USB_TXAGG_BULK_END_WD: a WD ending exactly at a
+  // USB packet boundary must start a new transfer, before consuming its data.
+  if (!aggregate.empty() &&
+      (aggregate.size() + descriptor_length) % bulk_packet_size == 0)
+    return false;
+  const size_t offset = aggregate.size();
+  const size_t aligned = (frame.size() + 7u) & ~size_t{7u};
+  aggregate.resize(offset + aligned, 0);
+  std::memcpy(aggregate.data() + offset, frame.data(), frame.size());
+  return true;
+}
+
 /* AX_TXD_DATARATE indices: CCK 1/2/5.5/11 = 0..3, OFDM 6/9/12/18/24/36/48/54 =
  * 4..11; HT/VHT/HE add 0x80/0x100/0x180 (M5). */
 enum { RATE_CCK1 = 0, RATE_OFDM6 = 4, RATE_OFDM24 = 8 };

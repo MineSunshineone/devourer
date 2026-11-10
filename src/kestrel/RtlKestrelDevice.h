@@ -355,6 +355,7 @@ private:
   std::atomic<uint16_t> _tx_seq{0};
   std::recursive_mutex _tx_packet_mutex;
   bool _tx_usb_agg_active = false;
+  bool _tx_usb_agg_full = false;
   uint8_t _tx_usb_agg_ep = 0;
   uint16_t _tx_usb_agg_count = 0;
   std::vector<uint8_t> _tx_usb_agg_buf;

@@ -1388,6 +1388,11 @@ if(DEVOURER_KESTREL)
     target_link_libraries(KestrelRetuneSelftest PRIVATE devourer)
     add_test(NAME kestrel_retune COMMAND KestrelRetuneSelftest)
 
+    add_executable(KestrelUsbAggregateSelftest tests/kestrel_usb_aggregate_selftest.cpp)
+    target_compile_features(KestrelUsbAggregateSelftest PRIVATE cxx_std_20)
+    target_include_directories(KestrelUsbAggregateSelftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME kestrel_usb_aggregate COMMAND KestrelUsbAggregateSelftest)
+
     # Golden-bytes guard for the trigger-UL + TWT H2C content encoders
     # (src/kestrel/SchedEncode.h): each config's emitted LE dwords vs the
     # hand-computed vendor SET_WORD layout (F2P v0/v1, TWT, UL_FIXINFO).
