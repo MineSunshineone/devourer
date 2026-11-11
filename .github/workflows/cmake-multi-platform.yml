@@ -220,6 +220,12 @@ jobs:
             flags: "-DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF"
           - name: pcie+8821c-only
             flags: "-DDEVOURER_PCIE=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF -DDEVOURER_KESTREL_8852C=OFF"
+          - name: pcie+8822b-only
+            flags: "-DDEVOURER_PCIE=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF -DDEVOURER_KESTREL_8852C=OFF"
+          - name: pcie+8822c-only
+            flags: "-DDEVOURER_PCIE=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF -DDEVOURER_KESTREL_8852C=OFF"
+          - name: pcie+kestrel-8852b-only
+            flags: "-DDEVOURER_PCIE=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852C=OFF"
           - name: pcie+kestrel-8852c-only
             flags: "-DDEVOURER_PCIE=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF"
           - name: pcie+all
@@ -278,7 +284,11 @@ jobs:
           -S ${{ github.workspace }}
 
       - name: Build (ASan + UBSan)
-        run: cmake --build build-asan -j
+        # Bounded: a bare -j is unlimited, and ~50 concurrent RelWithDebInfo
+        # ASan/UBSan compiles + links exhaust the hosted runner's memory — it
+        # is then killed mid-link ("The runner has received a shutdown
+        # signal", exit 143), as on master c39b99b and PR #516.
+        run: cmake --build build-asan -j "$(nproc)"
 
       - name: Test (ASan + UBSan)
         working-directory: build-asan
@@ -312,9 +322,11 @@ jobs:
       - name: Reject "PCIe without a PCIe-capable chip"
         run: |
           if cmake -B build-pcie-bad -DDEVOURER_PCIE=ON \
-                -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_KESTREL_8852C=OFF \
+                -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR2_8822B=OFF \
+                -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_KESTREL_8852B=OFF \
+                -DDEVOURER_KESTREL_8852C=OFF \
                 -S "${{ github.workspace }}" 2>err.log; then
-            echo "ERROR: configure should have failed (PCIe without 8821C or 8852C)"; cat err.log; exit 1
+            echo "ERROR: configure should have failed (PCIe without a PCIe-capable chip)"; cat err.log; exit 1
           fi
           grep -q "DEVOURER_PCIE=ON requires" err.log
 

@@ -86,6 +86,8 @@ struct WriteBatchScope {
 
 void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
+  _rx_stop = false;
+
   /* A new session has sent no wide frame: a re-bring-up must not inherit the
    * previous session's wide-TX IGI floor (_wide_tx_seen). */
   _wide_tx_seen.store(false, std::memory_order_relaxed);
@@ -195,7 +197,7 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
     std::lock_guard<std::mutex> lk(_reg_mu);
     _station_ready = true; /* every port-0 write of this bring-up is done */
   }
-  StartRxLoop(std::move(packetProcessor));
+  start_rx_loop(std::move(packetProcessor), false);
 }
 
 void RtlJaguar3Device::arm_beamformee() {
@@ -225,9 +227,24 @@ void RtlJaguar3Device::arm_beamformee() {
 }
 
 void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
+  start_rx_loop(std::move(packetProcessor), true);
+}
+
+void RtlJaguar3Device::start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale) {
+  /* A signal has already landed: skip the setup below rather than build it
+   * for a loop whose own predicate would exit on its first pass. */
+  if (g_devourer_should_stop)
+    return;
+
   _packetProcessor = std::move(packetProcessor);
-  /* Restartable: clear any stop request left by a prior StopRxLoop(). */
-  _rx_stop = false;
+
+  if (clear_stale) {
+    _rx_stop = false;
+  } else if (_rx_stop) {
+    /* Stop requested during Init must prevent its receive loop from starting */
+    return;
+  }
+
   /* Take over bulk-IN from the coex thread's C2H drain up front — also during
    * the register restore below, so its 200 ms bulk reads don't interleave with
    * the RX-path enable sequence. */
@@ -316,7 +333,7 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
           std::lock_guard<std::mutex> lk(_reg_mu);
           /* edcca_track follows the EDCCA gate alone — see the housekeeping
            * tick below for why the all-or-nothing flag is the wrong input. */
-          _phydm.tick(_channel.Channel, !_cca_edcca_disabled);
+          _phydm.tick(_channel.Channel, !_cca_edcca_disabled, !_cfg.tuning.skip_dig);
         } catch (...) {
           break; /* chip gone — the RX loop will wind down too */
         }
@@ -534,7 +551,14 @@ void RtlJaguar3Device::coex_runtime_loop() {
   auto next_tick = std::chrono::steady_clock::now();
   const auto period = std::chrono::seconds(2);
   while (!_coex_stop && !g_devourer_should_stop) {
-    if (!_rx_loop_active.load()) {
+    if (!_device.is_usb()) {
+      /* PCIe: there is no single-shot bulk read — RX (and so C2H) is the
+       * BD ring, which only StartRxLoop drains. A TX-only PCIe session keeps
+       * the coex heartbeat cadence here and sees no CCX tx.report (run
+       * DEVOURER_TX_WITH_RX=thread for those, as on J1/J2). Without this
+       * branch bulk_read_raw returns -1 at once and the loop spins. */
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    } else if (!_rx_loop_active.load()) {
       /* Drain bulk-IN (empties the FW C2H buffer). 200 ms timeout bounds
        * shutdown latency when the pipe is idle. */
       int n =
@@ -583,7 +607,7 @@ void RtlJaguar3Device::coex_runtime_loop() {
        * thresholds at 0x84c every ~2 s in the EDCCA-off/primary-on arm,
        * undoing the disable the caller asked for. Jaguar1 does the same
        * thing via SetEdccaTrack(!edcca_disabled) at the end of apply_cca. */
-      _phydm.tick(_channel.Channel, !_cca_edcca_disabled);
+      _phydm.tick(_channel.Channel, !_cca_edcca_disabled, !_cfg.tuning.skip_dig);
       _hal.fw_update_wl_phy_info();
       _hal.fw_set_pwr_mode_active();
       _hal.fw_coex_query_bt_info();
@@ -1235,7 +1259,10 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
    * adapter's transfer counter, so anything emitted after it would count
    * that thread's register and H2C traffic as bring-up. */
   timer.total();
-  _coex_thread = std::thread([this] { coex_runtime_loop(); });
+  if (_cfg.tuning.j3_runtime_thread)
+    _coex_thread = std::thread([this] { coex_runtime_loop(); });
+  else
+    _logger->info("Jaguar3: coex/phydm runtime thread not started (tuning.j3_runtime_thread)");
   if (_cfg.tx.power_index)
     SetTxPowerIndexOverride(*_cfg.tx.power_index);
   if (_cfg.rx.ack_responder &&

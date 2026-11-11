@@ -49,6 +49,7 @@
 #include "SweepSpec.h"
 #include "TxPower.h" /* txpkt_pwr_db_for_step — DEVOURER_TX_PKT_OFSET fan-out */
 #include "caps_event.h"
+#include "poll_skip.h"
 #include "station_arm_env.h"
 #if defined(DEVOURER_HAVE_JAGUAR1)
 #include "jaguar1/RtlJaguarDevice.h"
@@ -1442,6 +1443,7 @@ int main(int argc, char **argv) {
                  "warn_delta={}", thermal_poll_ms, thermal_warn_delta);
   }
   bool thermal_warned = false;
+  devourer::PollSkips thermal_skips("DEVOURER_THERMAL_POLL_MS");
   auto thermal_next_poll = std::chrono::steady_clock::now() +
       std::chrono::milliseconds(thermal_poll_ms);
 
@@ -1898,6 +1900,10 @@ int main(int argc, char **argv) {
       tx_frame_limit = 0;
   }
   long consec_fail = 0;
+  /* Transport failures counted at the start of the CURRENT failure streak,
+   * so the abort below can tell a NAKing chip from frames the backend refused
+   * before any USB (GetTxStats().failed is cumulative over the session). */
+  uint64_t streak_failed_base = 0;
   /* If the TX path isn't enabled the chip NAKs every bulk-OUT; hammering a
    * non-draining endpoint for the whole run is what wedged its USB core. Bail
    * out after a short burst of consecutive failures so we shut down cleanly
@@ -2603,7 +2609,12 @@ int main(int argc, char **argv) {
         std::chrono::steady_clock::now() >= thermal_next_poll) {
       thermal_next_poll = std::chrono::steady_clock::now() +
           std::chrono::milliseconds(thermal_poll_ms);
-      auto t = rtlDevice->GetThermalStatus();
+      devourer::ThermalStatus t;
+      try {
+        t = rtlDevice->GetThermalStatus();
+      } catch (const std::exception &e) {
+        thermal_skips.note(*logger, e);
+      }
       if (t.valid || t.raw != 0) {
         devourer::Ev ev(*g_ev, "thermal");
         ev.t().f("raw", t.raw);
@@ -2627,11 +2638,28 @@ int main(int argc, char **argv) {
     }
     if (rc) {
       consec_fail = 0;
-    } else if (++consec_fail >= kMaxConsecFail) {
-      logger->error("TX aborting: {} consecutive bulk-OUT failures — TX path "
-                    "not enabled (chip NAKing). Stopping to avoid wedging the "
-                    "adapter; clean card-disable follows.",
-                    consec_fail);
+    } else if ((consec_fail == 0 &&
+                (streak_failed_base = rtlDevice->GetTxStats().failed, true)),
+               ++consec_fail >= kMaxConsecFail) {
+      /* Two different failures share send_packet's `false`: the transport
+       * refusing the URB (a NAKing chip — the wedge risk this abort exists
+       * for) and the backend refusing the FRAME before any USB happens (a
+       * width or rate the channel cannot carry, logged by name by the
+       * backend). GetTxStats().failed counts only the former, so it tells
+       * them apart; blaming the USB path for a refused frame sent more than
+       * one operator after the wrong fault. */
+      const auto st = rtlDevice->GetTxStats();
+      if (st.failed > streak_failed_base)
+        logger->error("TX aborting: {} consecutive bulk-OUT failures — TX "
+                      "path not enabled (chip NAKing). Stopping to avoid "
+                      "wedging the adapter; clean card-disable follows.",
+                      consec_fail);
+      else
+        logger->error("TX aborting: the backend refused {} consecutive frames "
+                      "before any USB transfer (no bulk-OUT failures) — a "
+                      "rate/width/encoding the channel cannot carry; its own "
+                      "error line above names it.",
+                      consec_fail);
       break;
     }
     bool burst_off_window = false;

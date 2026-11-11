@@ -307,9 +307,10 @@ struct DeviceConfig {
      * `tx.report` events. The TX-side link sensor. On the HalMAC chips the
      * descriptor SW_DEFINE also carries a rotating 8-bit tag the report
      * echoes (per-frame correlation). Default off (descriptors
-     * byte-identical). Needs an RX loop to deliver the C2H reports. RTL8733B
-     * is an explicit exception: its backend has no H2C/MEDIA_STATUS_RPT path,
-     * warns that the request is unsupported, and emits no `tx.report` events.
+     * byte-identical). Needs an RX loop to deliver the C2H reports. On the
+     * RTL8733B the reports exist only on a firmware the session itself loaded
+     * — a running image reused across a card power cycle emits no C2H — so
+     * that backend reloads the firmware at every bring-up.
      *
      * Value = sampling divisor N: 1 requests a report on EVERY frame, N > 1
      * on every Nth (0..255). The CCX emission path saturates at ~1.3–1.4 k
@@ -367,7 +368,28 @@ struct DeviceConfig {
     bool skip_coex = false;         /* env: DEVOURER_SKIP_COEX (J2) */
     bool kestrel_bt_grant = false;  /* env: DEVOURER_KESTREL_BT_GRANT;
                                      * 8852B combo board with BT antenna */
-    bool skip_dig = false;          /* env: DEVOURER_SKIP_DIG (J2) */
+    /* env: DEVOURER_J3_RUNTIME ("0" disables) — Jaguar3: start the coex /
+     * phydm watchdog runtime thread after bring-up (default ON). With no RX
+     * loop running, that thread also keeps a bulk-IN read posted to drain
+     * firmware C2H reports, and every ~2 s it writes coex, TX-power tracking
+     * and DIG/EDCCA registers. A host that owns bulk-IN itself (raw C2H)
+     * turns it off. This flag covers only that post-bring-up thread:
+     * StartRxLoop still runs its own phydm watchdog (DIG included) when the
+     * thread is off, so fixed gain during an RX session also needs skip_dig.
+     * A TX-only session with the thread off loses all of it: nothing drains
+     * C2H, so no tx.report (CCX) is emitted; pwr_track (thermal TX-power
+     * compensation, which sustains upper 5 GHz) stops; and the coex re-apply
+     * and FW heartbeats stop (src/jaguar3/CLAUDE.md: sustained 5 GHz TX
+     * needs them). */
+    bool j3_runtime_thread = true;
+    /* env: DEVOURER_SKIP_DIG — J2: StartRxLoop starts no DIG thread; J3: the
+     * phydm watchdog (runtime thread and StartRxLoop worker) skips its DIG
+     * step.
+     * On J3 the wide-TX IGI floor (wide_tx_igi_floor) still writes IGI: the
+     * first 40/80 MHz frame raises a lower IGI to the floor, and leaving the
+     * floor clamps IGI down to the DIG window top. For IGI that stays exactly
+     * where the host put it, also set DEVOURER_WIDE_TX_IGI_FLOOR=0. */
+    bool skip_dig = false;
     /* env: DEVOURER_THERMAL_TRACK — Jaguar2 thermal TX-power tracking
      * (default ON; "0" disables). A ~2 s tick reads the RF 0x42 thermal
      * meter, computes the delta vs the efuse baseline, and writes the vendor

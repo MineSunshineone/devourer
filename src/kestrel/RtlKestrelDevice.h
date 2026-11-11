@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -179,6 +180,12 @@ public:
    * beacon's TBTT with it, the Jaguar1 model. PCIe-measured only. */
   bool WriteTsf(uint64_t tsf) override;
 
+  /* Port-0 TSF, then R_AX_FREERUN_CNT (never moved by WriteTsf), each with a
+   * hi/lo/hi wrap guard. */
+  bool ReadTsfAndFreeRun(uint64_t &tsf, uint64_t &freerun) override;
+  /* Beacon EDCA random backoff on/off (HalKestrel::set_beacon_backoff). */
+  bool SetBeaconBackoff(bool random) override;
+
   /* Jaguar1 semantics (see IRadio): the AX TBTT already sits on the TSF grid,
    * so offset 0 holds natively and a nonzero TSF-preserving pin is physically
    * unavailable — refused with a one-time warning. Discipline the TSF itself
@@ -217,6 +224,10 @@ public:
    * prior InitWrite. `beacon` is a full 802.11 beacon; the MAC airs it every
    * `interval_tu` TU with the live TSF inserted. */
   bool StartBeacon(const uint8_t *beacon, size_t len, int interval_tu) override;
+  /* New content for the armed beacon (BCN_UPD H2C; port/TBTT untouched). */
+  bool UpdateBeaconPayload(const uint8_t *beacon, size_t len) override;
+  /* BCNTX_EN off; returns false when no beacon is armed. */
+  bool StopBeacon() override;
   int _bcn_interval_tu = 0; /* >0 while a HW beacon is armed (StartBeacon) */
 
   /* 802.11ax scheduled UL: air an HE Basic Trigger (UL-OFDMA grant), program
@@ -298,6 +309,20 @@ private:
   std::atomic<bool> _bf_active{false};
   std::atomic<bool> _bf_apply_requested{false};
   std::atomic<uint64_t> _bf_reports{0}, _bf_rejected{0}, _bf_feedback_ms{0};
+  /* One pass of BringUpMonitor, no firmware-halt check. */
+  bool BringUpMonitorOnce(SelectedChannel channel);
+  /* The TX half of InitWrite, run after BringUpMonitorOnce. */
+  void InitWriteTail(SelectedChannel channel);
+  /* Run `once` (a full bring-up from power_on), then read HALT_C2H_CTRL. A
+   * bring-up can end with the firmware halted (L1 pre-error 0x999, then an
+   * assertion) while every step reported success; the radio then works for a
+   * while and its TX queues stop draining for good. Redo the bring-up, up to
+   * kFwHaltAttempts in all on USB (PCIe: no redo). False, with the bulk-IN
+   * drain stopped, when `once` fails or every attempt halts. */
+  bool BringUpCheckingFwHalt(const char *what,
+                             const std::function<bool()> &once);
+  static constexpr int kFwHaltAttempts = 3;
+
   /* Route a C2H firmware message (RPKT_TYPE_C2H payload). Currently decodes the
    * USR_TX_RPT_INFO report and emits its freerun TX-egress timestamp. */
   void handle_c2h(const uint8_t *payload, uint32_t len);
@@ -310,10 +335,13 @@ private:
   SelectedChannel _channel{};
   kestrel::EfuseInfo _efuse{};
   volatile bool _rx_stop = false;
-  /* TX-only bulk-IN drain: received frames and PHY/C2H traffic still arrive.
-   * Host WP status reports (rpkt_type=7) are optional and disabled by the
-   * USB/STF defaults. Without draining, TX-only can stall after ~103 frames.
-   * InitWrite starts this
+
+  void start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale);
+
+  /* WP-release drain (Kestrel STF USB): the fw returns each transmitted frame's
+   * WD/PLE pages as an RX packet (rpkt_type=7, TX_PD_RELEASE_HOST) on the bulk-
+   * IN. A TX-only path must still drain the bulk-IN or the pages never recycle
+   * and the mgmt bulk-OUT stalls after ~103 frames. InitWrite starts this
    * background drain; StartRxLoop hands the bulk-IN over to itself (which also
    * drains type-7), so the two never read the endpoint concurrently. */
   std::thread _wp_drain_thread;

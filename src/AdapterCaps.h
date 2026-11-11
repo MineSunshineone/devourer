@@ -27,6 +27,7 @@
 #define DEVOURER_ADAPTER_CAPS_H
 
 #include <cstdint>
+#include <string_view>
 
 #include "TxCaps.h"
 #include "TxPower.h"
@@ -151,7 +152,10 @@ struct AdapterCaps {
    * on-air. The TX side lives in TxCaps.ldpc_ok. HT and VHT are separate
    * decoder paths in silicon, so the flags split: the RTL8821A field failure
    * ("PixelPilot can't RX LDPC from Eachine Sphere Link") is VHT-only. --- */
-  bool ldpc_rx_ht = false;  /* baseband decodes LDPC-coded HT PPDUs */
+  bool ldpc_rx_ht = false;  /* baseband decodes LDPC-coded HT PPDUs. RTL8733B:
+                             * measured false — 0/1542 LDPC MCS7 frames vs
+                             * 93% BCC from an 8822BU — while its TX-LDPC
+                             * (TxCaps.ldpc_ok) is measured true. */
   bool ldpc_rx_vht = false; /* baseband decodes LDPC-coded VHT PPDUs */
   /* Per-frame LDPC *reporting*: RxAtrib.ldpc is populated (RX-descriptor bit
    * on the 8812A die, PHY-status byte7[5] on Jaguar2/3). False on the 8814A —
@@ -248,8 +252,9 @@ struct AdapterCaps {
    * tx_retry_limit_ok: DEVOURER_TX_RETRY_LIMIT drives hardware autonomous
    * retransmission (measured 12/0/12 A/B: 8821AU, 8812BU, 8822CU; the 8733B
    * by airtime dose-response instead, 0/3/12 -> 1.00/4.00/12.32–12.33 airings per
-   * frame, because that die has no CCX path to judge its own frames
-   * (tests/rtl8733b_retry_limit_onair.sh); Kestrel
+   * frame — measured before that die's CCX reports were reached; its own
+   * tx.report off cell since pins 12.0 mean retries at 0.98 report coverage
+   * (tests/rtl8733b_retry_limit_onair.sh, tests/ack_txreport_matrix.sh); Kestrel
    * 8832CU witness-measured — the AX WD DATA_TXCNT_LMT field counts
    * ATTEMPTS, folded +1 to the N-retries contract, limits {0,2,8} -> modal
    * on-air copies {1,3,8-9}; the MT7612U by its own TX status FIFO -
@@ -476,6 +481,13 @@ struct AdapterCaps {
   bool hw_injected_mgmt_txtsf = false;
   bool tsf_write_ok = false;
   bool tbtt_follows_tsf = false;
+  /* beacon_backoff_ctl: IRadio::SetBeaconBackoff can turn the hardware
+   * beacon's EDCA random backoff off, so a beacon leaves a fixed AIFS after
+   * its TBTT instead of AIFS + 0..CW random slots. Kestrel: the vendor/default
+   * beacon queue is ecw_min 2 / ecw_max 3, AIFS 25 us, measured on an
+   * RTL8852CE as departures at exactly 22/30/39/48 us after TBTT (~equal
+   * shares); with the backoff off, 568/569 beacons left at 22 us. */
+  bool beacon_backoff_ctl = false;
   /* 802.11ax scheduled UL (Kestrel/RTL8852 only). trigger_ul_ok: the adapter
    * can air an HE Trigger frame (UL-OFDMA grant) and program the fw UL-OFDMA
    * scheduler (SendTrigger / ConfigureUlOfdma). twt_ok: the fw exposes the TWT
@@ -490,6 +502,35 @@ struct AdapterCaps {
    * host-injected SendTrigger is what puts a Trigger on the air. */
   bool sounding_ok = false;
 };
+
+/* The M4 (#258) sync tier of a DU built on this adapter, from the timing caps
+ * above (derived, so it cannot drift from them). M5's coordinator reads it.
+ *   Tight  — PCIe/MMIO, a writable TSF the hardware beacon's TBTT follows: the
+ *            PTP discipline (src/cell/TsfDiscipline.h) holds the beacon grid to
+ *            ~us (RTL8852CE: on-air TBTT p95 ~4 us across three cells). Eligible
+ *            for same-channel coordinated slots.
+ *   Coarse — a hardware beacon with a writable TSF over a slower bus or a
+ *            TBTT that does not follow the write (USB; Jaguar2/3, steered per
+ *            TU): ~0.5-1.5 ms disturbance. Needs ms guards or its own channel.
+ *   None   — no hardware beacon or no TSF write: cannot hold a shared grid.
+ * The tier is what the TSF-write actuator achieves. A part steered another way
+ * (PinBeaconTbtt, measured to ~0.67 us on the 8821CE) is not promoted by it. */
+enum class SyncTier : uint8_t { None = 0, Coarse = 1, Tight = 2 };
+
+inline const char *sync_tier_name(SyncTier t) {
+  switch (t) {
+  case SyncTier::Tight: return "tight";
+  case SyncTier::Coarse: return "coarse";
+  default: return "none";
+  }
+}
+
+inline SyncTier sync_tier(const AdapterCaps &c) {
+  if (!c.hw_beacon_txtsf || !c.tsf_write_ok)
+    return SyncTier::None;
+  const bool pcie = c.transport && std::string_view(c.transport) == "pcie";
+  return pcie && c.tbtt_follows_tsf ? SyncTier::Tight : SyncTier::Coarse;
+}
 
 inline void set_standard_freq_ranges(AdapterCaps &c) {
   c.tune_2g4 = BandRange{true, 2412, 2484};

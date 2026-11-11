@@ -9,6 +9,10 @@ method = source.read_text(encoding='utf-8').split(
     'void RtlJaguar3Device::PollBeamforming', 1)[1].split(
     '\nvoid RtlJaguar3Device::ClearBeamforming', 1)[0]
 code = r'''
+#include "VhtSounding.h"
+#include <algorithm>
+#include <chrono>
+#include <exception>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -30,6 +34,7 @@ void apply_vmatrix(Registers& registers, bool enable, uint8_t) {
 }
 }}
 struct Logger {
+  template<class... T> void error(T...) {}
   template<class... T> void warn(T...) {}
   template<class... T> void info(T...) {}
 };
@@ -46,7 +51,9 @@ struct RtlJaguar3Device {
   Logger* _logger = &logger;
   bool steered_mapping = false;
   void set_bf_data_mapping(bool enable) { steered_mapping = enable; }
-  void PollBeamforming(uint64_t);
+  std::atomic<uint64_t> _bf_register_busy_skips{0}, _bf_control_reads{0};
+  std::atomic<uint64_t> _bf_control_total_us{0}, _bf_control_max_us{0};
+  void PollBeamforming(uint64_t, bool allow_apply = true);
 };
 '''
 code += 'void RtlJaguar3Device::PollBeamforming' + method
@@ -75,6 +82,6 @@ output.mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='bf-gate-', dir=output) as directory:
     path = Path(directory)
     (path/'check.cpp').write_text(code, encoding='utf-8')
-    subprocess.run(['c++', '-std=c++20', str(path/'check.cpp'), '-o', str(path/'check')], check=True)
+    subprocess.run(['c++', '-std=c++20', '-I', str(source.parents[1]), str(path/'check.cpp'), '-o', str(path/'check')], check=True)
     subprocess.run([str(path/'check')], check=True)
 print('PASS: each CSI refresh is hardware-validated; mismatch and expiry restore normal TX')

@@ -48,6 +48,10 @@ MAC off from any retained state, while a USB reset on running firmware drops
 the chip to ROM — a stale-handle re-enumeration that can land in the dead
 ZeroCD DISK id (`0bda:1a2b`).
 
+Bring-up drains the USB bulk-IN from `intf_init` on and checks for a halted
+firmware at its end; do not move the drain later (8852C quirk,
+`docs/8852c-quirks.md`).
+
 ## Validated capability surface
 
 On-air-validated: monitor RX (both dies, 2.4/5 GHz; the RX front-end needs
@@ -313,9 +317,9 @@ usb→pcie05 800, pcie05→usb 799, usb→pcie09 800, pcie09→usb 799,
 pcie05→pcie09 800; the 5 GHz matrix re-run beside it: 800 / 752 / 800 /
 791 / 797.
 
-## PCIe (RTL8852CE)
+## PCIe (RTL8852CE, RTL8852BE)
 
-The 8852CE is this HAL over the PCIe transport (`src/PcieDmaAx.cpp` is the
+The 8852CE and 8852BE are this HAL over the PCIe transport (`src/PcieDmaAx.cpp` is the
 DMA plane; root CLAUDE.md has the transport picture). Everything the HAL
 does differently on PCIe hangs off `is_usb()`; nothing here is a second HAL:
 
@@ -357,9 +361,55 @@ does differently on PCIe hangs off `is_usb()`; nothing here is a second HAL:
   per-path RSSI/EVM/SNR populate at the same rate as on USB. The plane's
   exit line prints the RXQ packet-type histogram (t0 frames, t1 PPDU status,
   t10 C2H) — a PCIe receiver with t1=0 has lost its physts, not its frames.
-- **Not ported**: MSI (the plane polls the ring indices, 200 µs), the 8852BE
-  (refused at the factory), the CAV-cut-only `l12_vmain`/`gen2_force_ib` rows
-  (the lab modules are cut 1), and interrupt mitigation.
+- **RTL8852BE** (`10ec:b852`, die `0x51`): the same plane class with
+  `AxDie::C8852B` — the die's older PCIe DMA engine, not the HAXI: 7 TX
+  channels (ACH0-3, CH8 B0MG, CH9 B0HI, CH12 FWCMD), TXBD DESA at `0x1110`+,
+  BDRAM_CTRL_V2 at `0x1200`+, RXQ/RPQ at `0x1020/0x1050/0x1100` and
+  `0x1022/0x1054/0x1108`, 24-byte `wd_body` with no ADDR_INFO_NUM field and
+  one 8-byte addr_info per WD page, HIMR00 `0x10B0` only. Several HAXI
+  addresses are other registers here (`0x1200` is ACH0_BDRAM_CTRL), so the
+  HAL's `pcie_b_*` set (vendor `_pcie_8852b.c`: INIT_CFG1 TXHCI b11 / RXHCI
+  b13, STOP1/BUSY1 at `0x1010/0x101C`, BDRAM reset under PS_CTRL FORCE_L0,
+  LTR v0 at `0x8410..0x841C` with LTR_EN = bit 1) never runs on the C and vice
+  versa. Power-on adds `0x70[12]` cleared and the CAV/CBV `_patch_ck_buf_level`
+  (HCI LDO VADJ 0xA); `clr_pcie_avoid_pldr_polling_fail` runs before
+  `hci_func_en`; DLE/HFC take the `dle_mem_pcie_8852b` /
+  `hfc_*_pcie_8852b_turbo` SCC_TURBO rows (DLFW H2C pre-cost 40). **The
+  engine's DMA reads ride the PCIe IO path**: with STOP_PCIEIO left set until
+  post-init (the HAXI order) the FWCMD channel reports BUSY with a frozen
+  hardware index and FWDL fails every attempt; `pcie_b_pre_init` releases IO
+  before FWDL. **A full RXQ halts its TX channels** (DBG_ERR_FLAG
+  `PCIE_RXQ_FULL`, HISR `RDU`): a TX-only session never serviced the RXQ,
+  ambient frames filled it, and B0MG froze after 57–195 frames — so the
+  plane's TX path drains and discards the RXQ whenever no RX loop runs (both
+  dies; the HAXI merely tolerated the full ring). Measured on one LB-LINK
+  BL-M8852BP4 (cut B, RFE 1, z890p) vs a USB RTL8812AU witness, 6M, 10,000
+  frames/cell (`tests/pcie_8822ce_onair.sh --bdfs 0000:85:00.0`): ch36
+  witness→BE 99.7%, BE→witness 96.0%, hop 36/40/44 with the witness on each
+  channel 31.8 / 31.9 / 31.0%; ch6 98.2% / 75.0%, hop 1/6/11 28.4 / 25.6 /
+  28.3%. `tests/pcie_rx_smoke.py` 1356/956 beacons on ch6/ch36, 0 CRC fails;
+  two rounds of `tests/pcie_teardown_asan.sh` RX+TX clean, 0 DMAR faults,
+  0 AER errors (this card's link is clean in the z890p slot that was
+  marginal for the 88xx cards). The same BE against a second witness, a
+  USB RTL8852CU (LB-LINK BL-M8852CU1, `0bda:c85a`, USB 2.0) on the same
+  host: ch36 CU→BE 98.9%, BE→CU 98.7%, hop 32.8 / 32.4 / 32.3%; ch6 99.2% /
+  98.0%, hop 32.6 / 32.5 / 31.7%. So the ch6 "75%" above was the 8812AU
+  witness's receive leg on a busy channel, not the BE's transmitter — the
+  reason every delivery figure here names its witness. One module, one
+  rate; no throughput bench; MSI and interrupt mitigation unported as on
+  the C. The 8852CU itself (`tests/regress.py` devourer cells, 15 s, vs
+  the 8812AU — that harness reports hits against a TX count taken from
+  rate-limited `tx.frame` events, which undercounts, so its ratios are not
+  delivery percentages and can read above 1): CU→8812AU 7818 hits on ch36
+  and 6161 on ch6 — the 8812AU's ch6 receive leg again — and 8812AU→CU 9285
+  and 9231 hits, both with the harness's pass verdict. Standalone
+  on this host it decoded 8709 ambient frames in 60 s on ch6 but only 3 on
+  ch36 while the 8852BE beside it saw ~1000/s there — near-field peers
+  reach it at 98%, distant 5 GHz traffic does not; an antenna/module
+  question for that unit, unmeasured.
+- **Not ported**: MSI (the plane polls the ring indices, 200 µs), the
+  CAV-cut-only `l12_vmain`/`gen2_force_ib` rows (the lab modules are cut 1),
+  and interrupt mitigation.
 
 Validation record (lab box, two RTL8852CE on one J6412: 05:00.0 on a root
 port, 09:00.0 behind an ASM1182e switch with the AER UR mask; witness = a
