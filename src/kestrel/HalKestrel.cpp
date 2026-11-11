@@ -1767,6 +1767,15 @@ void HalKestrel::mac_enable_imr() {
 }
 
 void HalKestrel::coex_mac_init() {
+  if (_pcie && _variant == ChipVariant::C8852C) {
+    if (_bt_grant)
+      throw std::runtime_error("Kestrel: 8852CE Bluetooth coexistence is not validated");
+    /* 8852C's no-coexistence vendor path uses a direct grant register. */
+    if (!_device.rtw_write32(r::R_AX_GNT_SW_CTRL, 0) ||
+        (_device.rtw_read32(r::R_AX_GNT_SW_CTRL) & r::B_AX_GNT_SW_CTRL_MASK))
+      throw std::runtime_error("Kestrel: 8852CE grant reset failed");
+    return;
+  }
   /* mac_coex_init_8852b prologue (coex_8852b.c:154): B_AX_ENBT arms the BT/
    * LTE-coex block — from a real cold boot the LTE indirect interface never
    * reports ready until it is set, so every write_lte below would time out
@@ -1966,6 +1975,16 @@ void HalKestrel::halbb_wpwr(void *dev, unsigned int addr, unsigned int val) {
 }
 void HalKestrel::halbb_delay(void *dev, unsigned int us) {
   (void)dev;
+  delay_us(us);
+}
+void HalKestrel::rf_write_delay(void *dev, unsigned int us) {
+  auto *self = static_cast<HalKestrel *>(dev);
+  if (self->_pcie && self->_variant == ChipVariant::C8852C) {
+    // Preserve the requested hardware delay without a scheduler round-trip per microsecond.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    while (std::chrono::steady_clock::now() < until) {}
+    return;
+  }
   delay_us(us);
 }
 unsigned int HalKestrel::halbb_rrf(void *dev, unsigned int path,
@@ -2373,7 +2392,7 @@ uint32_t HalKestrel::rf_read(uint8_t path, uint8_t rf_addr) {
 void HalKestrel::rf_write(uint8_t path, uint8_t rf_addr, uint32_t val) {
   const uint32_t base = path == 0 ? 0xe000 : 0xf000;
   _device.rtw_write32_wide(base + (rf_addr << 2) + BB_WIN, val & 0xfffffu);
-  delay_us(1);
+  rf_write_delay(this, 1);
 }
 
 void HalKestrel::rf_write_dav(uint8_t path, uint8_t rf_addr, uint32_t val) {
@@ -2394,7 +2413,7 @@ void HalKestrel::rf_write_dav(uint8_t path, uint8_t rf_addr, uint32_t val) {
     if (_device.rtw_read32_wide(0x370 + BB_WIN) == w)
       break;
   }
-  delay_us(5);
+  rf_write_delay(this, 5);
 }
 
 uint32_t HalKestrel::rf_read_dav(uint8_t path, uint8_t rf_addr) {

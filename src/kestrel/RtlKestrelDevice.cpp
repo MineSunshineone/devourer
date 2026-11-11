@@ -354,8 +354,9 @@ void RtlKestrelDevice::InitWrite(SelectedChannel channel) {
   /* The 8852B AP role answers unicast frames; its associated peer MACID
    * supplies the BlockAck context for ACK-enabled A-MPDU. */
   if (_cfg.rx.ack_responder) {
-    if (_variant != kestrel::ChipVariant::C8852B)
-      throw std::invalid_argument("Kestrel ACK responder requires 8852B");
+    if (_variant != kestrel::ChipVariant::C8852B &&
+        !(_variant == kestrel::ChipVariant::C8852C && !_device.is_usb()))
+      throw std::invalid_argument("Kestrel reliable peer requires 8852B or PCIe 8852C");
     const auto& mac = _cfg.rx.ack_responder->bytes;
     if (!_hal.register_ap_role(mac.data()) ||
         !_hal.set_port_net_type(kestrel::reg::MAC_AX_NET_TYPE_AP))
@@ -924,7 +925,8 @@ bool RtlKestrelDevice::ConfigureAckPeer(const devourer::MacAddr &local,
            std::any_of(mac.bytes.begin(), mac.bytes.end(),
                        [](std::uint8_t byte) { return byte != 0; });
   };
-  if (_variant != kestrel::ChipVariant::C8852B || !valid(local) ||
+  if ((_variant != kestrel::ChipVariant::C8852B &&
+       !(_variant == kestrel::ChipVariant::C8852C && !_device.is_usb())) || !valid(local) ||
       !valid(peer) || local.bytes == peer.bytes)
     return false;
   // A new peer must start with a fresh BlockAck window, even on the same TID.
@@ -956,6 +958,13 @@ void RtlKestrelDevice::ClearAckPeer() {
     if (!_hal.configure_ba_responder(_ampdu.tid, false))
       throw std::runtime_error("Kestrel BA peer clear failed");
     _ba_cam_armed = false;
+  }
+  if (_variant == kestrel::ChipVariant::C8852C && !_device.is_usb()) {
+    for (const uint8_t index : {uint8_t{0}, uint8_t{1}}) {
+      if (!_hal.clear_addr_cam_entry(index) ||
+          (_hal.read_mac_mem32(_hal.addr_cam_entry_addr(index)) & 1u))
+        throw std::runtime_error("Kestrel: PCIe peer CAM clear failed");
+    }
   }
   if (!_hal.register_sta_role(0, 0, 0) ||
       !_hal.set_port_net_type(kestrel::reg::MAC_AX_NET_TYPE_NO_LINK) ||

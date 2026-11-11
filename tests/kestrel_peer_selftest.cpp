@@ -4,6 +4,7 @@
 #include "kestrel/KestrelLe.h"
 
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <map>
 #include <stdexcept>
@@ -16,12 +17,17 @@ class FakeRegs final : public devourer::ITransport {
   bool usb = true, fail_ba = false;
   uint16_t fail_reg = 0xffff;
   std::map<uint16_t, uint32_t> regs;
+  std::map<uint32_t, uint32_t> memory;
   std::vector<bool> ba;
+  unsigned lte_reads = 0;
   bool is_usb() const override { return usb; }
   devourer::UsbLinkInfo usb_info() const override {
     return {.valid = usb, .bulk_out_eps = {1, 2, 3, 4, 5, 6, 7}};
   }
-  uint8_t read8(uint16_t a) override { return static_cast<uint8_t>(regs[a]); }
+  uint8_t read8(uint16_t a) override {
+    if (a == 0xdaf3) ++lte_reads;
+    return static_cast<uint8_t>(regs[a]);
+  }
   uint16_t read16(uint16_t a) override { return static_cast<uint16_t>(regs[a]); }
   uint32_t read32(uint16_t a) override { return regs[a]; }
   bool write8(uint16_t a, uint8_t v) override { return write32(a, v); }
@@ -31,13 +37,26 @@ class FakeRegs final : public devourer::ITransport {
     regs[a] = v;
     return true;
   }
+  bool write32_wide(uint32_t a, uint32_t v) override {
+    if (a == kestrel::reg::R_AX_INDIR_ACCESS_ENTRY) {
+      memory[regs[kestrel::reg::R_AX_FILTER_MODEL_ADDR]] = v;
+      return true;
+    }
+    return write32(static_cast<uint16_t>(a), v);
+  }
+  uint32_t read32_wide(uint32_t a) override {
+    return a == kestrel::reg::R_AX_INDIR_ACCESS_ENTRY
+               ? memory[regs[kestrel::reg::R_AX_FILTER_MODEL_ADDR]]
+               : read32(static_cast<uint16_t>(a));
+  }
   bool write_bytes(uint16_t, const uint8_t *, size_t) override { return true; }
   bool tx_async(uint8_t, uint8_t *, size_t, unsigned) override { return true; }
   int tx_sync(uint8_t, uint8_t *p, size_t n, int) override {
     namespace r = kestrel::reg;
-    if (n >= 40 && ((kestrel::le32(p + 24) >> r::H2C_HDR_CLASS_SH) & 0x3f) == r::FWCMD_H2C_CL_BA_CAM) {
+    const size_t desc = usb ? 24 : 16;
+    if (n >= desc + 16 && ((kestrel::le32(p + desc) >> r::H2C_HDR_CLASS_SH) & 0x3f) == r::FWCMD_H2C_CL_BA_CAM) {
       if (fail_ba) return -1;
-      ba.push_back((kestrel::le32(p + 32) & 1) != 0);
+      ba.push_back((kestrel::le32(p + desc + 8) & 1) != 0);
     }
     return static_cast<int>(n);
   }
@@ -145,5 +164,49 @@ int main() {
   const TxPacketView views[]{{packet.data(), packet.size()}, {packet.data(), packet.size()}};
   CHECK(pcie.send_packets(views, 2) == 2);
   CHECK(pcie.frames == 2);
+
+  auto ce_regs = std::make_shared<FakeRegs>();
+  ce_regs->usb = false;
+  PeerKestrel ce(RtlAdapter(ce_regs, logger), logger, kestrel::ChipVariant::C8852C);
+  CHECK(ce.ConfigureAckPeer(local, a));
+  const uint32_t ce_peer_cam = r::ADDR_CAM_MEM_BASE + r::ADDR_CAM_ENT_SHORT_SIZE;
+  CHECK((ce_regs->memory[ce_peer_cam] & 1u) != 0);
+  CHECK(ce_regs->memory[ce_peer_cam + 8] == 0x00000002u);
+  CHECK(ce_regs->memory[ce_peer_cam + 12] == 0x00020100u);
+  CHECK(ce.SetAmpduMode(mode));
+  CHECK(ce.ConfigureAckPeer(local, b));
+  CHECK(ce.SetAmpduMode(mode));
+  CHECK((ce_regs->ba == std::vector<bool>{true, false, true}));
+  CHECK(ce_regs->memory[ce_peer_cam + 16] == 0x03000000u);
+  ce.ClearAckPeer();
+  CHECK((ce_regs->memory[ce_peer_cam] & 1u) == 0);
+  ce_regs->fail_reg = r::R_AX_FILTER_MODEL_ADDR;
+  CHECK(!ce.ConfigureAckPeer(local, a));
+
+  // The 8852C uses direct coexistence registers, not the 8852B LTE window.
+  auto coex_regs = std::make_shared<FakeRegs>();
+  coex_regs->usb = false;
+  coex_regs->regs[0xda48] = 0x00155555;
+  kestrel::HalKestrel coex(RtlAdapter(coex_regs, logger), logger,
+                            kestrel::ChipVariant::C8852C);
+  for (const unsigned delay : {1u, 5u}) {
+    const auto started = std::chrono::steady_clock::now();
+    kestrel::HalKestrel::rf_write_delay(&coex, delay);
+    CHECK(std::chrono::steady_clock::now() - started >= std::chrono::microseconds(delay));
+  }
+  bool coex_failed = false;
+  try { coex.coex_mac_init(); } catch (const std::runtime_error &) { coex_failed = true; }
+  CHECK(!coex_failed);
+  CHECK(coex_regs->lte_reads == 0);
+  CHECK((coex_regs->regs[0xda48] & 0x00155555u) == 0u);
+  coex_regs->fail_reg = 0xda48;
+  coex_failed = false;
+  try { coex.coex_mac_init(); } catch (const std::runtime_error &) { coex_failed = true; }
+  CHECK(coex_failed);
+  coex_regs->fail_reg = 0xffff;
+  coex.set_bt_grant(true);
+  coex_failed = false;
+  try { coex.coex_mac_init(); } catch (const std::runtime_error &) { coex_failed = true; }
+  CHECK(coex_failed);
   return failures ? 1 : 0;
 }

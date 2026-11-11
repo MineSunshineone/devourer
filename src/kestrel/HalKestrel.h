@@ -282,9 +282,13 @@ public:
     bool ok = _fw.fw_role_maintain(macid, reg::MAC_AX_SELF_ROLE_AP,
                                    reg::MAC_AX_WIFI_ROLE_AP,
                                    reg::MAC_AX_ROLE_CREATE, band, port);
-    ok = _fw.fw_upd_addr_cam(macid, bssid, reg::MAC_AX_NET_TYPE_AP,
-                             /*addr_cam_idx=*/0, /*bssid_cam_idx=*/0) &&
-         ok;
+    if (_pcie && _variant == ChipVariant::C8852C) {
+      ok = write_addr_cam_sta(0, bssid, bssid, macid, 0, reg::MAC_AX_NET_TYPE_AP) && ok;
+      ok = addr_cam_sta_holds(0, bssid, bssid, macid, 0, reg::MAC_AX_NET_TYPE_AP) && ok;
+    } else {
+      ok = _fw.fw_upd_addr_cam(macid, bssid, reg::MAC_AX_NET_TYPE_AP,
+                               /*addr_cam_idx=*/0, /*bssid_cam_idx=*/0) && ok;
+    }
     ok = _fw.fw_upd_cctl_basic(macid, /*addr_cam_idx=*/0, reg::MAC_AX_OFDM6,
                                /*ntx_path_en=*/1, /*path_map_a=*/0,
                                /*bmc=*/false) &&
@@ -362,7 +366,7 @@ public:
    * into the physical address CAM -- the vendor's no-firmware path
    * (mac_upd_addr_cam's indirect SRAM write), for the 8852C, whose firmware
    * ignores the addr_cam H2C. The same SHORT entry the 8852B firmware commits:
-   * VALID, net_type INFRA, the SMA/TMA hashes (XOR of the address bytes),
+   * VALID, net_type, the SMA/TMA hashes (XOR of the address bytes),
    * `bssid_cam_idx`, SMA=own, TMA=bssid, `macid` plus the vendor's bit 14.
    * Only the address CAM: the vendor path also writes the BSSID CAM entry,
    * but host-writing it changed nothing measurable (the response rate, and
@@ -372,8 +376,9 @@ public:
    * callers verify with addr_cam_sta_holds(). */
   bool write_addr_cam_sta(uint8_t idx, const uint8_t own[6],
                           const uint8_t bssid[6], uint8_t macid,
-                          uint8_t bssid_cam_idx) {
-    const auto w = addr_cam_sta_entry(own, bssid, reg::MAC_AX_NET_TYPE_INFRA,
+                          uint8_t bssid_cam_idx,
+                          uint8_t net_type = reg::MAC_AX_NET_TYPE_INFRA) {
+    const auto w = addr_cam_sta_entry(own, bssid, net_type,
                                       bssid_cam_idx, macid);
     const uint32_t base = addr_cam_entry_addr(idx);
     /* VALID off first (a retarget rewrites a live entry), then the body, then
@@ -394,8 +399,9 @@ public:
    * written (measured; the other seven read back as written). */
   bool addr_cam_sta_holds(uint8_t idx, const uint8_t own[6],
                           const uint8_t bssid[6], uint8_t macid,
-                          uint8_t bssid_cam_idx) {
-    const auto w = addr_cam_sta_entry(own, bssid, reg::MAC_AX_NET_TYPE_INFRA,
+                          uint8_t bssid_cam_idx,
+                          uint8_t net_type = reg::MAC_AX_NET_TYPE_INFRA) {
+    const auto w = addr_cam_sta_entry(own, bssid, net_type,
                                       bssid_cam_idx, macid);
     const uint32_t base = addr_cam_entry_addr(idx);
     for (int i = 0; i < 8; ++i)
@@ -461,9 +467,16 @@ public:
                                    reg::MAC_AX_WIFI_ROLE_STATION,
                                    reg::MAC_AX_ROLE_CREATE, /*band=*/0,
                                    /*port=*/0);
-    ok = _fw.fw_upd_addr_cam(macid, local_mac,
-                             reg::MAC_AX_NET_TYPE_AP, addr_cam_idx,
-                             /*bssid_cam_idx=*/0, peer_mac, local_mac) && ok;
+    if (_pcie && _variant == ChipVariant::C8852C) {
+      ok = write_addr_cam_sta(addr_cam_idx, local_mac, peer_mac, macid, 0,
+                              reg::MAC_AX_NET_TYPE_AP) && ok;
+      ok = addr_cam_sta_holds(addr_cam_idx, local_mac, peer_mac, macid, 0,
+                              reg::MAC_AX_NET_TYPE_AP) && ok;
+    } else {
+      ok = _fw.fw_upd_addr_cam(macid, local_mac,
+                               reg::MAC_AX_NET_TYPE_AP, addr_cam_idx,
+                               /*bssid_cam_idx=*/0, peer_mac, local_mac) && ok;
+    }
     ok = _fw.fw_upd_cctl_basic(macid, addr_cam_idx, reg::MAC_AX_OFDM6,
                                /*ntx_path_en=*/1, /*path_map_a=*/0,
                                /*bmc=*/false) && ok;
@@ -746,6 +759,7 @@ public:
   static unsigned int halbb_rpwr(void *dev, unsigned int addr);
   static void halbb_wpwr(void *dev, unsigned int addr, unsigned int val);
   static void halbb_delay(void *dev, unsigned int us);
+  static void rf_write_delay(void *dev, unsigned int us);
   /* fwcmd H2C plane (bridge send_h2c): forwards ONLY the OUTSRC radio-page
    * classes into KestrelFw's encoder; other halrf H2Cs stay inert. */
   static int halbb_send_h2c(void *dev, unsigned char h2c_class,

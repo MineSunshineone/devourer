@@ -1657,6 +1657,8 @@ constexpr uint32_t B_AX_ADDR_CAM_CLR = 1u << 8;
 
 /* ---- coex_mac_init (coex_8852b.c) — LTE/BT coexistence bring-up on the
  * WiFi+BT combo die: disable LTE-coex, set the SDIO-ctrl coex bit. ---- */
+constexpr uint16_t R_AX_GNT_SW_CTRL = 0xDA48; /* 8852C direct grant register */
+constexpr uint32_t B_AX_GNT_SW_CTRL_MASK = 0x00155555;
 constexpr uint16_t R_AX_LTE_CTRL = 0xDAF0;
 constexpr uint16_t R_AX_LTE_WDATA = 0xDAF4;
 constexpr uint32_t R_AX_LTECOEX_CTRL = 0x38;   /* LTE-space indirect offset */

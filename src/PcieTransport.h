@@ -55,6 +55,8 @@ public:
      * a lost edge from ever stalling RX). Falls back to pure polling
      * automatically when MSI setup fails. */
     bool use_msi = true;
+    /* Optional supervisor socket; DMA is not enabled until it acknowledges. */
+    int guard_socket = -1;
   };
 
   /* Open the vfio-pci device at `bdf` ("0000:01:00.0"). Returns null and logs

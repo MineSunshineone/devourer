@@ -1,4 +1,5 @@
 #include "PcieTransport.h"
+#include "PcieGuard.h"
 
 /* Linux-only (vfio). Compiled only when DEVOURER_PCIE=ON — the CMake option is
  * gated on Linux. */
@@ -40,9 +41,9 @@ std::shared_ptr<PcieTransport> PcieTransport::Open(const std::string &bdf,
   t->_bdf = bdf;
   if (!t->open_vfio(bdf))
     return nullptr;
-  if (!t->map_bar2())
-    return nullptr;
   if (!t->setup_config_space())
+    return nullptr;
+  if (!t->map_bar2())
     return nullptr;
   if (!t->select_dma_plane())
     return nullptr;
@@ -218,6 +219,11 @@ bool PcieTransport::open_vfio(const std::string &bdf) {
   if (_device < 0) {
     _logger->error("PcieTransport: GET_DEVICE_FD({}) failed: {}", bdf,
                    strerror(errno));
+    return false;
+  }
+  if (_cfg.guard_socket >= 0 &&
+      !pcie_guard_send(_cfg.guard_socket, _container, _group, _device)) {
+    _logger->error("PcieTransport: supervisor did not accept VFIO descriptors");
     return false;
   }
   _logger->info("PcieTransport: vfio group {} opened for {}", group_num, bdf);
