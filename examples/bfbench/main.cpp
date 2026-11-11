@@ -20,12 +20,14 @@ using namespace std::chrono_literals;
 
 int main(int argc, char **argv) {
   if (argc != 5 || (std::strcmp(argv[1], "rx") && std::strcmp(argv[1], "txoff") &&
-                    std::strcmp(argv[1], "txon") && std::strcmp(argv[1], "txread"))) {
-    std::fprintf(stderr, "bfbench rx|txoff|txread|txon seconds Mbps run_id\n"); return 2;
+                    std::strcmp(argv[1], "txon") && std::strcmp(argv[1], "txlow") &&
+                    std::strcmp(argv[1], "txread"))) {
+    std::fprintf(stderr, "bfbench rx|txoff|txread|txon|txlow seconds Mbps run_id\n"); return 2;
   }
   install_devourer_signal_handlers();
   const bool tx = std::strcmp(argv[1], "rx") != 0;
-  const bool apply = std::strcmp(argv[1], "txon") == 0;
+  const bool low_power = std::strcmp(argv[1], "txlow") == 0;
+  const bool apply = std::strcmp(argv[1], "txon") == 0 || low_power;
   unsigned seconds, run;
   double mbps;
   try {
@@ -67,7 +69,8 @@ int main(int argc, char **argv) {
   radio->SetTxMode(mode);
   // Keep both calibrated references above the rail; nominal qdB is not measured RF power.
   if (tx) {
-    if (radio->SetTxPowerOffsetQdb(-24) != -24) return 1;
+    const int power_offset = low_power ? -48 : -24;
+    if (radio->SetTxPowerOffsetQdb(power_offset) != power_offset) return 1;
     const auto power = radio->GetTxPowerState();
     std::printf("BF_POWER offset=%d mcs7_ref=%d low=%d high=%d readback=%d\n",
       power.offset_qdb,power.mcs7_index,power.saturated_low,power.saturated_high,power.hw_readback);
