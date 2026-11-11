@@ -2,6 +2,7 @@
 #define RTL_KESTREL_DEVICE_H
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -243,6 +244,10 @@ public:
                           uint8_t addr_cam_idx,
                           const devourer::StaBfCaps &bf) override;
   bool StartSounding(const devourer::SoundingConfig &cfg) override;
+  bool SendBeamformingSounding(uint8_t token) override;
+  void PollBeamforming(uint64_t max_feedback_age_ms, bool allow_apply = true) override;
+  void ClearBeamforming() override;
+  devourer::BeamformingStatus GetBeamformingStatus() override;
 
   /* AX-native identity read (no power-on needed — the identity block is alive
    * as soon as the USB function enumerates). kestrelprobe stage "id" and the
@@ -282,6 +287,17 @@ public:
   void EnableTxScheduler();
 
 private:
+  void configure_su_csi_peer();
+  void receive_beamforming_feedback(const kestrel::KestrelRxFrame &frame);
+  std::mutex _bf_mutex;
+  bool _bf_armed = false;
+  std::array<uint8_t, 6> _bf_self{}, _bf_peer{};
+  uint8_t _bf_dialog = 0;
+  bool _bf_pending = false;
+  std::atomic<uint8_t> _bf_bw{0};
+  std::atomic<bool> _bf_active{false};
+  std::atomic<bool> _bf_apply_requested{false};
+  std::atomic<uint64_t> _bf_reports{0}, _bf_rejected{0}, _bf_feedback_ms{0};
   /* Route a C2H firmware message (RPKT_TYPE_C2H payload). Currently decodes the
    * USR_TX_RPT_INFO report and emits its freerun TX-egress timestamp. */
   void handle_c2h(const uint8_t *payload, uint32_t len);

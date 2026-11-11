@@ -61,7 +61,7 @@ public:
   /* Firmware download: hci_func_en + DLE/HFC pre-init + FWDL of the
    * cut-appropriate NICCE image. Must run after power_on. `cut` is the chip
    * cut version (from ReadChipInfo / R_AX_SYS_CFG1[15:12]). */
-  bool download_firmware(uint8_t cut);
+  bool download_firmware(uint8_t cut, bool sounding_nic = false);
 
   /* mac_sys_init (init.c:309): DMAC func-en (incl. CRPRT), CMAC clock + func
    * enables (CK_EN then CMAC_FUNC_EN), chip_func_en OCP patch. Vendor order:
@@ -582,7 +582,7 @@ public:
     namespace k = kestrel::reg;
     bool ok = _fw.fw_upd_cctl_bf(macid, addr_cam_idx, bf);
     /* snd-status index -> macid (R_AX_BFMER_ASSOCIATED_SU0 + SND_SH*idx). */
-    _device.rtw_write32(
+    _device.rtw_write16(
         static_cast<uint16_t>(k::R_AX_BFMER_ASSOCIATED_SU0 +
                               k::SND_STS_SH * snd_idx),
         k::B_AX_MER_SU_BFMEE0_EN | macid);
@@ -603,6 +603,23 @@ public:
    * and receives the beamformee's report HE TB PPDU. */
   bool start_sounding(const devourer::SoundingConfig &cfg) {
     return _fw.set_snd_para(cfg);
+  }
+
+  // The CSI buffer is hardware-written; index 0 is the single SU peer's buffer.
+  // MACID 0 is the vendor's reserved mapping when aborting a BF entry.
+  void apply_su_matrix(bool enable) {
+    _device.rtw_write32(kestrel::reg::R_AX_BFMER_CSI_BUFF_IDX0, enable ? 1u : 0u);
+  }
+
+  void prepare_su_sounding() {
+    apply_su_matrix(false);
+    _device.rtw_write16(kestrel::reg::R_AX_BFMER_ASSOCIATED_SU0,
+                       kestrel::reg::B_AX_MER_SU_BFMEE0_EN | 1u);
+  }
+
+  bool su_sounding_valid() {
+    return (_device.rtw_read<uint16_t>(kestrel::reg::R_AX_BFMER_ASSOCIATED_SU0) &
+            kestrel::reg::B_AX_MER_SU_BFMEE0_SND_STS) != 0;
   }
 
   /* Firmware SER probe: returns the latched mac_ax_err_info code if the fw has

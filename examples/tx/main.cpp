@@ -1482,6 +1482,7 @@ int main(int argc, char **argv) {
    * bulk-OUT URBs; without it send_packets degrades to the per-frame loop.
    * Default 1 = the classic send_packet loop, byte-identical. */
   long tx_batch = 1;
+  const bool tx_beamforming = std::getenv("DEVOURER_BF_TXBF") != nullptr;
   if (const char *e = std::getenv("DEVOURER_TX_BATCH")) {
     tx_batch = std::strtol(e, nullptr, 0);
     if (tx_batch < 1)
@@ -2123,6 +2124,7 @@ int main(int argc, char **argv) {
   }
 
   while (!g_devourer_should_stop) {
+    if (tx_beamforming) rtlDevice->PollBeamforming(500);
     if (tx_count == 0) {
       devourer::Ev(*g_ev, "init.timing")
           .f("stage", "txdemo.first_tx_submit")

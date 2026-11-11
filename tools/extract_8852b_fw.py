@@ -10,7 +10,8 @@ fwdl.h INTERNAL_FW_CONTENT_8852B_{CBV,CCV}_NICCE mapping. Both are extracted;
 the Kestrel FW module picks by the cut it read at identity time.
 
 Of the vendor categories (nic / nicce / nicce_bplus / wowlan...) devourer
-takes NICCE only — the image the Linux CE driver itself loads
+takes NICCE for ordinary operation and NIC for explicit sounding experiments —
+the Linux CE driver itself loads NICCE
 (rtl8852b_halinit.c: fw_type = RTW_FW_NIC_CE). The *_bplus images are the
 RTL8852BP special case, not our silicon; wowlan is out of scope.
 
@@ -35,6 +36,8 @@ OUTPUT_H = "hal/hal8852b_fw.h"
 ARRAYS = {
     "array_8852b_u2_nicce": "NICCE image for cut CBV (u2)",
     "array_8852b_u3_nicce": "NICCE image for cut CCV and later (u3)",
+    "array_8852b_u2_nic": "NIC image for explicit sounding, cut CBV (u2)",
+    "array_8852b_u3_nic": "NIC image for explicit sounding, cut CCV+ (u3)",
 }
 
 
@@ -74,10 +77,10 @@ def main() -> int:
     header = (
         "/* RTL8852B (Kestrel: RTL8852BU / RTL8832BU, Wi-Fi 6) WLAN firmware "
         "blobs.\n"
-        f" * Extracted (NICCE images only) from {UPSTREAM_TAG}\n"
+        f" * Extracted (NICCE and NIC images) from {UPSTREAM_TAG}\n"
         " * phl/hal_g6/mac/fw_ax/rtl8852b/hal8852b_fw.c by "
         "tools/extract_8852b_fw.py.\n"
-        " * Two images, selected at runtime by chip cut (CBV -> u2, CCV+ -> "
+        " * Cut-specific images, selected at runtime by chip cut (CBV -> u2, CCV+ -> "
         "u3);\n"
         " * consumed by src/kestrel (mac_ax fwdl path). */\n"
     )
@@ -93,7 +96,7 @@ def main() -> int:
         )
         h_decls.append(f"extern const u8 {name}[];\nextern const u32 {name}_len;\n")
     h_text = (
-        "/* Auto-extracted RTL8852B NICCE firmware blobs (u2 = cut CBV, u3 = "
+        "/* Auto-extracted RTL8852B NICCE/NIC firmware blobs (u2 = cut CBV, u3 = "
         "cut CCV+).\n * See hal8852b_fw.c. */\n"
         "#ifndef HAL8852B_FW_H\n"
         "#define HAL8852B_FW_H\n"

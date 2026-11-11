@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "VhtSounding.h"
+#include "kestrel/TxDescKestrel.h"
 #include "jaguar3/FrameParserJaguar3.h"
 #ifdef NDEBUG
 #undef NDEBUG
@@ -8,6 +9,14 @@
 #include <vector>
 
 int main() {
+  devourer::TxMode ht;
+  ht.mode = devourer::TxMode::Mode::HT;
+  ht.ht_mcs = 7;
+  ht.bw_mhz = 40;
+  ht.sgi = ht.ldpc = ht.stbc = true;
+  const auto vht = devourer::bf::vht_su_mode(ht);
+  assert(vht.mode == devourer::TxMode::Mode::VHT && vht.vht_mcs == 7 && vht.vht_nss == 1);
+  assert(vht.bw_mhz == 40 && vht.sgi && vht.ldpc && !vht.stbc);
   const uint8_t self[6]{2, 1, 2, 3, 4, 5}, peer[6]{2, 6, 7, 8, 9, 10};
   assert(!devourer::bf::poll_required(true, true, false, true));
   assert(!devourer::bf::poll_required(true, true, true, false));
@@ -144,4 +153,16 @@ int main() {
   assert(attr.phy_fill == PhyStsFill::Power);
   jaguar3::parse_phy_sts_jgr3(nullptr, 0, 0, attr);
   assert(attr.phy_fill == PhyStsFill::None);
+  const auto exchange = kestrel::build_vht_sounding(ndpa.data(), 0, 7);
+  assert(exchange.size() == 67); // One 48B WD + 19B NDPA, no zero-length host packet.
+  const auto word = [&](unsigned offset) {
+    return unsigned(exchange[offset]) | (unsigned(exchange[offset + 1]) << 8) |
+        (unsigned(exchange[offset + 2]) << 16) | (unsigned(exchange[offset + 3]) << 24);
+  };
+  assert(word(4) == 0); // No USB aggregation.
+  assert((word(8) & 0x3fff) == 19);
+  assert(word(24 + 12) == 4); // VHT NDPA selector; no firmware-exchange chain.
+  assert(((word(24) >> 16) & 0x1ff) == 0x110); // 2SS VHT MCS0.
+  assert((word(24 + 20) >> 16) == 256);
+  assert(std::memcmp(exchange.data() + 48, ndpa.data(), ndpa.size()) == 0);
 }

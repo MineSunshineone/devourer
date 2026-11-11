@@ -52,6 +52,20 @@ int main() {
       }
     }
     qos[24] = 0;
+    for (const bool usb : {false, true}) {
+      std::vector<uint8_t> data, management;
+      kestrel::build_data_txdesc_into(data, qos.data(), qos.size(), rate, 1,
+                                      2, body, 1, 16, 7, usb);
+      kestrel::build_mgnt_txdesc_into(management, qos.data(), qos.size(), rate,
+                                      0, 2, body, 1, usb);
+      if (bool(le32(data, 0) & kestrel::txd::STF_MODE) != usb ||
+          bool(le32(management, 0) & kestrel::txd::STF_MODE) != usb ||
+          (le32(data, 12) & kestrel::txd::AGG_EN) == 0 ||
+          ((le32(data, 8) >> 24) & 0x7f) != 1) {
+        std::fprintf(stderr, "Kestrel bus descriptor mismatch (body=%u USB=%d)\n", body, usb);
+        return 1;
+      }
+    }
   }
   const std::array<uint8_t, 6> peer{2, 0x42, 0x58, 0x49, 0x24, 0x22};
   std::copy(peer.begin(), peer.end(), qos.begin() + 4);

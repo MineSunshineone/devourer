@@ -2,6 +2,7 @@
 #pragma once
 
 #include "BfReportDecode.h"
+#include "TxMode.h"
 #include <array>
 #include <cstring>
 #include <optional>
@@ -65,6 +66,15 @@ private:
   unsigned _format = 0;
   std::vector<double> _phi, _psi, _next_phi, _next_psi;
 };
+inline TxMode vht_su_mode(TxMode mode) {
+  if (mode.mode == TxMode::Mode::HT && mode.ht_mcs <= 7) {
+    mode.mode = TxMode::Mode::VHT;
+    mode.vht_mcs = mode.ht_mcs;
+    mode.vht_nss = 1;
+  }
+  mode.stbc = false;
+  return mode;
+}
 
 // Single unassociated SU peer, AID 0, one feedback column (IEEE VHT NDPA).
 inline std::array<uint8_t, 19> vht_ndpa(const uint8_t self[6],

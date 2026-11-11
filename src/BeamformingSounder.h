@@ -98,12 +98,12 @@ constexpr BfeeConfig kBfeeJaguar23{
 inline void arm_sounder(RtlAdapter& dev, uint8_t snd_ptcl_ctrl = 0xCB) {
   dev.rtw_write8(kSndPtclCtrl, snd_ptcl_ctrl);
   dev.rtw_write8(kSndNdpStandby, 0x50);
-  dev.rtw_write16(kTxbfCtrl, 0x0000);                 /* P_AID = 0 */
+  dev.rtw_write16(kTxbfCtrl, 0);
   uint8_t v = dev.rtw_read8(kTxbfCtrl + 3);
   dev.rtw_write8(kTxbfCtrl + 3, v | kTxbfNdpaEnables);
   uint8_t s = dev.rtw_read8(kBfmeeSel + 3);
   dev.rtw_write8(kBfmeeSel + 3, (s & 0x03) | 0x60);
-  dev.rtw_write16(kBfmeeSel, 0x0200);                 /* entry-0 select */
+  dev.rtw_write16(kBfmeeSel, 0x0200); /* entry-0, unassociated P_AID 0 */
 }
 
 /* Beamformee side: arm the hardware CSI responder to reply to NDPA+NDP from

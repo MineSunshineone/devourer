@@ -1216,6 +1216,7 @@ constexpr uint32_t B_AX_CSIRPT_EMPTY_APPZERO = 1u << 1; /* _patch_csi_append_zer
  * mac_set_csi_buffer_index). SND_SH/CSI_SH step the register per index. */
 constexpr uint16_t R_AX_BFMER_ASSOCIATED_SU0 = 0xCD00;
 constexpr uint32_t B_AX_MER_SU_BFMEE0_EN = 1u << 8;
+constexpr uint32_t B_AX_MER_SU_BFMEE0_SND_STS = 1u << 9;
 constexpr uint16_t SND_STS_SH = 0x2; /* per snd-sts index (SND_SH) */
 constexpr uint16_t R_AX_TRXPTCL_ERROR_INDICA_MASK = 0xCCBC; /* 8852C CSI unmask */
 constexpr uint32_t B_AX_RMAC_CSI = 1u << 7;

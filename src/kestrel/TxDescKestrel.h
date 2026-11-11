@@ -340,6 +340,21 @@ inline bool frame_is_data(const uint8_t *frame, uint32_t len) {
   return len >= 1 && ((frame[0] >> 2) & 0x3) == 0x2;
 }
 
+// Host NDPA, following core/rtw_beamforming.c's single management submission.
+// The firmware-exchange zero-length NDP WD is not a host USB packet.
+inline std::vector<uint8_t> build_vht_sounding(const uint8_t *ndpa,
+                                              uint8_t bw, uint16_t sequence) {
+  TxRate announcement{.rate = 0x110, .bw = bw}; // VHT 2SS MCS0 sounding dimensions.
+  auto first = build_mgnt_txdesc(ndpa, 19, announcement, 1, sequence,
+                                WD_BODY_LEN, 1);
+  txd_put_le32(first.data() + WD_BODY_LEN + 12, 2u << 1); // VHT NDPA, no F2P chain.
+  txd_put_le32(first.data() + WD_BODY_LEN + 4,
+               wd_info_dword1(ndpa, 19, 1) | (1u << 10)); // NAVUSEHDR.
+  txd_put_le32(first.data() + WD_BODY_LEN + 20,
+               static_cast<uint32_t>(ndpa[2] | (ndpa[3] << 8)) << 16);
+  return first;
+}
+
 } /* namespace kestrel */
 
 #endif /* KESTREL_TX_DESC_KESTREL_H */
